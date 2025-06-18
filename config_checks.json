@@ -1,0 +1,6 @@
+{
+  "checks": ["nsfw", "face_count", "partial_face"],
+  "output_dir": "C:/Users/newec/ComfyUI/output",
+  "fail_dir": "C:/Users/newec/ComfyUI/output/rejected",
+  "verified_path": "C:/Users/newec/ComfyUI/output/verified.png"
+} 
