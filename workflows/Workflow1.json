@@ -40,7 +40,7 @@
       "PowerLoraLoaderHeaderWidget": {
         "type": "PowerLoraLoaderHeaderWidget"
       },
-      "➕ Add Lora": "",
+      "\u2795 Add Lora": "",
       "model": [
         "173",
         0
@@ -303,7 +303,7 @@
     },
     "class_type": "ShowText|pysssss",
     "_meta": {
-      "title": "Show Text 🐍"
+      "title": "Show Text \ud83d\udc0d"
     }
   },
   "176": {
@@ -327,7 +327,7 @@
     },
     "class_type": "CR Latent Batch Size",
     "_meta": {
-      "title": "⚙️ CR Latent Batch Size"
+      "title": "\u2699\ufe0f CR Latent Batch Size"
     }
   },
   "178": {
@@ -359,7 +359,7 @@
     },
     "class_type": "InpaintCrop",
     "_meta": {
-      "title": "(OLD 💀, use the new ✂️ Inpaint Crop node)"
+      "title": "(OLD \ud83d\udc80, use the new \u2702\ufe0f Inpaint Crop node)"
     }
   },
   "179": {
@@ -474,7 +474,7 @@
     },
     "class_type": "InpaintStitch",
     "_meta": {
-      "title": "(OLD 💀, use the new ✂️ Inpaint Stitch node)"
+      "title": "(OLD \ud83d\udc80, use the new \u2702\ufe0f Inpaint Stitch node)"
     }
   },
   "184": {
@@ -533,7 +533,7 @@
     },
     "class_type": "CR Image Grid Panel",
     "_meta": {
-      "title": "🌁 CR Image Grid Panel"
+      "title": "\ud83c\udf01 CR Image Grid Panel"
     }
   },
   "189": {
@@ -547,8 +547,8 @@
   },
   "190": {
     "inputs": {
-      "file_path": "/home/eqx/workflow/stand1.txt",
-      "seed": 33
+      "file_path": "/home/eqx/workflow/texts/stand1.txt",
+      "seed": 105
     },
     "class_type": "Load Prompt From File - EQX",
     "_meta": {

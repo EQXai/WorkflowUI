@@ -6,6 +6,8 @@ from typing import List, Dict, Any
 
 import gradio as gr
 from PIL import Image
+import shutil
+import tempfile
 
 # Local modules
 import orchestrator as oc  # our previously created orchestrator.py
@@ -16,15 +18,123 @@ DEFAULT_OUTPUT_DIR = Path(oc.DEFAULT_OUTPUT_DIR)
 # Extra constants for advanced check configuration
 from run_checks import CATEGORY_DISPLAY_MAPPINGS, DEFAULT_NSFW_CATEGORIES
 
+# -------------------------------------------------------------
+# Dynamic form helpers for workflow editing
+# -------------------------------------------------------------
+
+# Will be populated during GUI build so that run_pipeline_gui can
+# access the mapping information.
+WF1_MAPPING: list[tuple[str, str, type]] = []  # (node_id, input_key, original_type)
+WF2_MAPPING: list[tuple[str, str, type]] = []
+
+# Flag used to signal cancellation from the GUI
+CANCEL_REQUESTED = False
+
+def _request_cancel():
+    global CANCEL_REQUESTED
+    CANCEL_REQUESTED = True
+    return "Cancellation requested. Finishing current step…"
+
+def _build_workflow_editor(json_path: str):
+    """Return (components, mapping) for the workflow located at *json_path*.
+
+    components: list of Gradio components created.
+    mapping: list of tuples (node_id, input_key, original_type) in the same order
+             as the returned components so that their values can later be mapped
+             back into the JSON structure.
+    """
+
+    from gradio.components import Textbox, Checkbox, Slider
+
+    data = json.loads(Path(json_path).read_text())
+    comps: list = []
+    mapping: list[tuple[str, str, type]] = []
+
+    # Sort nodes by numeric id for determinism when possible
+    def _node_sort(k):
+        try:
+            return int(k)
+        except Exception:
+            return k
+
+    for node_id in sorted(data.keys(), key=_node_sort):
+        node = data[node_id]
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not inputs:
+            continue
+
+        with gr.Accordion(f"{node_id} – {node.get('class_type', '')}", open=False):
+            # iterate over inputs in stable order
+            for key, val in inputs.items():
+                # choose component type heuristically
+                if isinstance(val, bool):
+                    comp = Checkbox(label=key, value=val)
+                elif isinstance(val, (int, float, str)):
+                    comp = Textbox(label=key, value=str(val))
+                else:
+                    # For list/dict or any other complex type, show JSON string
+                    comp = Textbox(label=key, value=json.dumps(val))
+
+                comps.append(comp)
+                mapping.append((node_id, key, type(val)))
+
+    return comps, mapping
+
+
+def _apply_edits_to_workflow(original_path: str, mapping: list[tuple[str, str, type]], values: list[str]) -> str:
+    """Create a temporary copy of *original_path* applying the edited *values*.
+
+    Returns the path to the temporary JSON file.
+    """
+    data = json.loads(Path(original_path).read_text())
+
+    for (node_id, key, typ), val in zip(mapping, values):
+        # Convert string input back to original type when possible
+        try:
+            if typ is bool:
+                cast_val = val if isinstance(val, bool) else val.lower() == "true"
+            elif typ is int:
+                cast_val = int(val)
+            elif typ is float:
+                cast_val = float(val)
+            elif typ in (list, dict):
+                # Expect JSON string representation
+                cast_val = json.loads(val)
+            else:
+                cast_val = val
+        except Exception:
+            cast_val = val  # fallback to raw string
+
+        if node_id in data and "inputs" in data[node_id]:
+            data[node_id]["inputs"][key] = cast_val
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix="_workflow.json")
+    os.close(tmp_fd)
+    Path(tmp_path).write_text(json.dumps(data, indent=2))
+    return tmp_path
+
 # -----------------------------------------------------------------------------
 # Custom CSS to show full portrait images without cropping (object-fit: contain)
 # -----------------------------------------------------------------------------
 
 CSS = """
-+.preview-img img {
++.pending-box {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    background-color: rgba(255, 255, 255, 0.9);
+    border: 1px solid #ccc;
+    padding: 6px 10px;
+    font-weight: bold;
+    z-index: 1000;
+}
+
+#results-gallery img {
     object-fit: contain !important;
     width: 100% !important;
-    height: 100% !important;
+    height: auto !important;
 }
 """
 
@@ -48,9 +158,14 @@ def run_pipeline_gui(
     confidence: float,
     margin: float,
     output_dir_str: str,
-    *nsfw_categories: bool,
+    final_dir_str: str,
+    batch_runs: int,
+    *dynamic_values: bool | str,
 ):
     """Function executed by the Gradio UI. Returns tuple of outputs."""
+    # Ensure at least 1 run (number of desired successful images)
+    batch_runs = max(1, int(batch_runs))
+
     # 1. Determine selected checks
     checks: List[str] = []
     if do_nsfw:
@@ -61,115 +176,202 @@ def run_pipeline_gui(
         checks.append("partial_face")
 
     if not checks:
-        return None, {}, "Debe seleccionar al menos un check.", None
+        return None, {}, "You must select at least one check.", None, "In Queue: 0"
 
     output_dir = Path(output_dir_str) if output_dir_str else DEFAULT_OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    final_dir = Path(final_dir_str) if final_dir_str else Path.home() / "ComfyUI" / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+
     log_lines: List[str] = []
 
-    # ----------------------------------------------------------------------
-    # Run Workflow 1
-    # ----------------------------------------------------------------------
-    log_lines.append("[WF1] Running Workflow1…")
-    start_time = time.time()
-    try:
-        oc.run_workflow(oc.WORKFLOW1_JSON)
-    except Exception as e:
-        return None, {}, f"Error while executing Workflow1: {e}", None
+    # Album de imágenes generadas (solo las que superan los checks)
+    album_images: List[Image.Image] = []
 
-    wf1_img_path = oc.newest_file(output_dir, after=start_time)
-    if wf1_img_path is None:
-        return None, {}, "Could not find the resulting image from Workflow1.", None
+    global CANCEL_REQUESTED
+    CANCEL_REQUESTED = False  # reset at start of each invocation
 
-    wf1_img_pil = _load_img(wf1_img_path)
+    # Split dynamic_values into nsfw category toggles and workflow edits
+    num_nsfw_cats = len([k for k in CATEGORY_DISPLAY_MAPPINGS.keys() if k != "NOT_DETECTED"])
+    nsfw_categories = dynamic_values[:num_nsfw_cats]
+    wf_edit_values = dynamic_values[num_nsfw_cats:]
 
-    log_lines.append(f"[WF1] Image generated: {wf1_img_path}")
-
-    # --------------------------------------------------------------
-    # Yield early so the user can already see the WF1 image
-    # --------------------------------------------------------------
-    yield wf1_img_pil, {}, "\n".join(log_lines), None
+    wf1_edit_vals = wf_edit_values[: len(WF1_MAPPING)]
+    wf2_edit_vals = wf_edit_values[len(WF1_MAPPING) :]
 
     # ----------------------------------------------------------------------
-    # Build optional parameters for run_checks according to UI
+    # Build modified workflow copies according to edits (only once at start
+    # of batch). They will be reused across attempts, but seed will still be
+    # incremented later as before.
     # ----------------------------------------------------------------------
-    allowed_categories = None
-    if do_nsfw and nsfw_categories:
-        # Map boolean list back to category names (sorted to match UI order)
-        cat_keys = [k for k in sorted(CATEGORY_DISPLAY_MAPPINGS.keys()) if k != "NOT_DETECTED"]
-        allowed_categories = {cat_keys[i] for i, checked in enumerate(nsfw_categories) if checked}
 
-    log_lines.append("[CHECK] Running external checks…")
-    try:
-        results = oc.run_checks(
-            wf1_img_path,
-            checks,
-            allowed_categories=allowed_categories,
-            confidence=confidence,
-            margin=margin,
+    wf1_path_mod = _apply_edits_to_workflow(oc.WORKFLOW1_JSON, WF1_MAPPING, wf1_edit_vals)
+    wf2_path_mod = _apply_edits_to_workflow(oc.WORKFLOW2_JSON, WF2_MAPPING, wf2_edit_vals)
+
+    target_successes = batch_runs
+    success_count = 0
+    attempt = 0
+
+    while success_count < target_successes:
+        if CANCEL_REQUESTED:
+            log_lines.append("[CANCEL] Execution cancelled by user.")
+            current_log = "\n\n".join(log_lines)
+            pending = max(0, target_successes - success_count)
+            yield None, current_log, None, album_images, f"In Queue: {pending}"
+            break
+
+        attempt += 1
+        # Separador visual entre intentos
+        if attempt > 1:
+            log_lines.append("")  # línea en blanco
+        log_lines.append(
+            f"========== ATTEMPT {attempt} | Passed {success_count}/{target_successes} =========="
         )
-    except Exception as e:
-        yield wf1_img_pil, {}, f"Error while executing checks: {e}", None
-        return
 
-    log_lines.append(f"[CHECK] Results: {json.dumps(results, indent=2, ensure_ascii=False)}")
+        # ------------------------------------------------------------------
+        # Run Workflow 1
+        # ------------------------------------------------------------------
+        log_lines.append("[WF1] Running Workflow1…")
+        start_time = time.time()
+        try:
+            from orchestrator import increment_seed_in_workflow
+            new_seed = increment_seed_in_workflow(wf1_path_mod)
+            if new_seed is not None:
+                log_lines.append(f"[SEED] Updated seed to {new_seed}")
+            else:
+                log_lines.append("[SEED] Warning: could not update seed (node not found)")
+            oc.run_workflow(wf1_path_mod)
+        except Exception as e:
+            err_msg = f"Error while executing Workflow1: {e}"
+            log_lines.append(err_msg)
+            current_log = "\n\n".join(log_lines)
+            pending = max(0, target_successes - success_count)
+            yield None, current_log, None, album_images, f"Pendientes: {pending}"
+            continue
 
-    # Emit after checks so the user sees results even si el pipeline va a continuar
-    yield wf1_img_pil, results, "\n".join(log_lines), None
+        wf1_img_path = oc.newest_file(output_dir, after=start_time)
+        if wf1_img_path is None:
+            err_msg = "Could not find the resulting image from Workflow1."
+            log_lines.append(err_msg)
+            current_log = "\n\n".join(log_lines)
+            pending = max(0, target_successes - success_count)
+            yield None, current_log, None, album_images, f"Pendientes: {pending}"
+            continue
 
-    # -----------------------------
-    # Decidir si falló
-    # -----------------------------
-    failed = False
-    if results.get("is_nsfw"):
-        failed = True
-        log_lines.append("[CHECK] Image flagged as NSFW. Pipeline stops.")
+        wf1_img_pil = _load_img(wf1_img_path)
 
-    if stop_multi_faces and results.get("face_count", 0) > 1:
-        failed = True
-        log_lines.append("[CHECK] More than one face detected and stop option is active.")
+        log_lines.append(f"[WF1] Image generated: {wf1_img_path}")
 
-    if stop_partial_face and results.get("is_partial_face"):
-        failed = True
-        log_lines.append("[CHECK] Partial face detected and stop option is active.")
+        # Show WF1 image immediately
+        current_log = "\n\n".join(log_lines)
+        pending = max(0, target_successes - success_count)
+        yield wf1_img_pil, current_log, None, album_images, f"Pendientes: {pending}"
 
-    if failed:
-        # Devolver solo wf1 image y log
-        yield wf1_img_pil, results, "\n".join(log_lines), None
-        return
+        # ----------------------------------------------------------------------
+        # Build optional parameters for run_checks according to UI
+        # ----------------------------------------------------------------------
+        allowed_categories = None
+        if do_nsfw and nsfw_categories:
+            cat_keys = [k for k in sorted(CATEGORY_DISPLAY_MAPPINGS.keys()) if k != "NOT_DETECTED"]
+            allowed_categories = {cat_keys[i] for i, checked in enumerate(nsfw_categories) if checked}
 
-    # ----------------------------------------------------------------------
-    # Run Workflow 2
-    # ----------------------------------------------------------------------
-    verified_path = output_dir / "verified_gui.png"
-    try:
-        Path(wf1_img_path).replace(verified_path)
-    except Exception:
-        # if move fails, try copy
-        import shutil
-        shutil.copy(wf1_img_path, verified_path)
+        log_lines.append("[CHECK] Running external checks…")
+        try:
+            results = oc.run_checks(
+                wf1_img_path,
+                checks,
+                allowed_categories=allowed_categories,
+                confidence=confidence,
+                margin=margin,
+            )
+        except Exception as e:
+            err_msg = f"Error while executing checks: {e}"
+            log_lines.append(err_msg)
+            current_log = "\n\n".join(log_lines)
+            pending = max(0, target_successes - success_count)
+            yield wf1_img_pil, current_log, None, album_images, f"Pendientes: {pending}"
+            continue
 
-    log_lines.append("[WF2] Running Workflow2…")
-    start_time2 = time.time()
-    overrides = {oc.LOAD_NODE_ID_WF2: {"image": str(verified_path)}}
-    try:
-        oc.run_workflow(oc.WORKFLOW2_JSON, overrides=overrides)
-    except Exception as e:
-        log_lines.append(f"Error while executing Workflow2: {e}")
-        yield wf1_img_pil, results, "\n".join(log_lines), None
-        return
+        log_lines.append(f"[CHECK] Results: {json.dumps(results, indent=2, ensure_ascii=False)}")
 
-    wf2_img_path = oc.newest_file(output_dir, after=start_time2)
-    if wf2_img_path is None:
-        log_lines.append("Could not find the resulting image from Workflow2.")
-        yield wf1_img_pil, results, "\n".join(log_lines), None
-        return
+        current_log = "\n\n".join(log_lines)
+        pending = max(0, target_successes - success_count)
+        yield wf1_img_pil, current_log, None, album_images, f"Pendientes: {pending}"
 
-    wf2_img_pil = _load_img(wf2_img_path)
-    log_lines.append(f"[WF2] Image generated: {wf2_img_path}")
+        # -----------------------------
+        failed = False
+        if results.get("is_nsfw"):
+            failed = True
+            log_lines.append("[CHECK] Image flagged as NSFW. Pipeline stops.")
 
-    yield wf1_img_pil, results, "\n".join(log_lines), wf2_img_pil
+        if stop_multi_faces and results.get("face_count", 0) > 1:
+            failed = True
+            log_lines.append("[CHECK] More than one face detected and stop option is active.")
+
+        if stop_partial_face and results.get("is_partial_face"):
+            failed = True
+            log_lines.append("[CHECK] Partial face detected and stop option is active.")
+
+        if failed:
+            # La ejecución se considera fallida; no incrementamos success_count
+            current_log = "\n\n".join(log_lines)
+            pending = max(0, target_successes - success_count)
+            yield wf1_img_pil, current_log, None, album_images, f"Pendientes: {pending}"
+            continue
+
+        # ----------------------------------------------------------------------
+        # Run Workflow 2
+        # ----------------------------------------------------------------------
+        verified_path = output_dir / "verified_gui.png"
+        try:
+            Path(wf1_img_path).replace(verified_path)
+        except Exception:
+            shutil.copy(wf1_img_path, verified_path)
+
+        log_lines.append("[WF2] Running Workflow2…")
+        start_time2 = time.time()
+        overrides = {oc.LOAD_NODE_ID_WF2: {"image": str(verified_path)}}
+        try:
+            oc.run_workflow(wf2_path_mod, overrides=overrides)
+        except Exception as e:
+            err_msg = f"Error while executing Workflow2: {e}"
+            log_lines.append(err_msg)
+            current_log = "\n\n".join(log_lines)
+            pending = max(0, target_successes - success_count)
+            yield wf1_img_pil, current_log, None, album_images, f"Pendientes: {pending}"
+            continue
+
+        wf2_img_path = oc.newest_file(output_dir, after=start_time2)
+        if wf2_img_path is None:
+            err_msg = "Could not find the resulting image from Workflow2."
+            log_lines.append(err_msg)
+            current_log = "\n\n".join(log_lines)
+            pending = max(0, target_successes - success_count)
+            yield wf1_img_pil, current_log, None, album_images, f"Pendientes: {pending}"
+            continue
+
+        wf2_img_pil = _load_img(wf2_img_path)
+        log_lines.append(f"[WF2] Image generated: {wf2_img_path}")
+
+        # Add the approved final image to the album and display
+        album_images.append(wf2_img_pil)
+
+        current_log = "\n\n".join(log_lines)
+        pending = max(0, target_successes - success_count)
+        yield wf1_img_pil, current_log, wf2_img_pil, album_images, f"Pendientes: {pending}"
+
+        try:
+            final_path = final_dir / wf2_img_path.name
+            shutil.copy(wf2_img_path, final_path)
+        except Exception as e:
+            log_lines.append(f"Warning: could not copy final image to {final_path}: {e}")
+
+        # Si llegamos aquí la imagen pasó todos los filtros ⇒ contamos como éxito
+        success_count += 1
+
+        # end loop iteration
+
     return
 
 
@@ -188,9 +390,13 @@ def launch_gui():
             """
         )
 
+        run_btn = gr.Button("Run Pipeline", variant="primary")
+        pending_box = gr.Markdown("Pendientes: 0", elem_id="pending-box", elem_classes=["pending-box"])
+
         with gr.Row():
             with gr.Column(scale=1):
                 output_dir_input = gr.Textbox(label="ComfyUI Output Folder", value=str(DEFAULT_OUTPUT_DIR))
+                final_dir_input = gr.Textbox(label="Destination Folder for Final Images", value=str((Path.home()/"ComfyUI"/"final").expanduser()))
 
                 with gr.Accordion("Checks to Perform", open=False):
                     do_nsfw_cb = gr.Checkbox(label="Detect NSFW", value=True)
@@ -235,7 +441,15 @@ def launch_gui():
                         label="Partial face margin",
                     )
 
-                    run_btn = gr.Button("Run Pipeline")
+                    batch_runs_slider = gr.Slider(
+                        minimum=1,
+                        maximum=20,
+                        value=1,
+                        step=1,
+                        label="Number of runs",
+                    )
+
+                    pass  # directory inputs finished
 
             with gr.Column(scale=3):
                 with gr.Row(equal_height=True):
@@ -253,8 +467,24 @@ def launch_gui():
                     )
 
         with gr.Row():
-            results_json = gr.JSON(label="Check Results")
-        log_text = gr.Textbox(label="Log", lines=15)
+            log_text = gr.Textbox(label="Log", lines=15, scale=1)
+
+            album_gallery = gr.Gallery(
+                label="Results",
+                columns=[1, 2, 3, 4],  # responsive: mobile→1, desktop→2-4 columns
+                elem_id="results-gallery",
+                scale=1,
+            )
+
+        # Dynamic workflow editors ------------------------------------------------
+
+        global WF1_MAPPING, WF2_MAPPING
+
+        with gr.Tab("Workflow 1 Config"):
+            wf1_components, WF1_MAPPING = _build_workflow_editor(str(oc.WORKFLOW1_JSON))
+
+        with gr.Tab("Workflow 2 Config"):
+            wf2_components, WF2_MAPPING = _build_workflow_editor(str(oc.WORKFLOW2_JSON))
 
         # Prepare inputs list in the same order expected by run_pipeline_gui
         run_btn.click(
@@ -268,12 +498,16 @@ def launch_gui():
                 confidence_slider,
                 margin_slider,
                 output_dir_input,
+                final_dir_input,
+                batch_runs_slider,
                 *nsfw_cat_checkboxes,
+                *wf1_components,
+                *wf2_components,
             ],
-            outputs=[wf1_img_out, results_json, log_text, wf2_img_out],
+            outputs=[wf1_img_out, log_text, wf2_img_out, album_gallery, pending_box],
         )
 
-    demo.queue().launch()
+    demo.queue().launch(server_name="0.0.0.0", server_port=18188, share=True)
 
 
 if __name__ == "__main__":

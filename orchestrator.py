@@ -52,8 +52,15 @@ def _detect_default_output_dir() -> str:
 # la ruta correcta automáticamente.
 DEFAULT_OUTPUT_DIR = os.getenv("COMFY_OUTPUT_DIR", _detect_default_output_dir())
 
-WORKFLOW1_JSON = "Workflow1.json"
-WORKFLOW2_JSON = "Workflow2.json"
+# -----------------------------------------------------------------------------
+# Workflow file locations
+# -----------------------------------------------------------------------------
+
+WORKFLOW_DIR = Path(os.getenv("WORKFLOW_DIR", str(Path(__file__).parent / "workflows")))
+
+# Paths to the two workflows used by the pipeline (relative to project root)
+WORKFLOW1_JSON = str(WORKFLOW_DIR / "Workflow1.json")
+WORKFLOW2_JSON = str(WORKFLOW_DIR / "Workflow2.json")
 
 # Node ID from Workflow2 that loads an image from a path. Adjust if you change
 # Workflow2.
@@ -260,4 +267,44 @@ if __name__ == "__main__":
         print(f"Config file {args.config} not found. Using default config.")
         cfg = {}
 
-    pipeline(cfg) 
+    pipeline(cfg)
+
+# -----------------------------------------------------------------------------
+# Workflow utilities
+# -----------------------------------------------------------------------------
+
+def increment_seed_in_workflow(path: str, node_class: str = "Load Prompt From File - EQX") -> int | None:
+    """Increment the *seed* value inside the node whose ``class_type`` equals *node_class*.
+
+    Parameters
+    ----------
+    path : str
+        File path to the workflow JSON that will be modified in place.
+    node_class : str, default 'Load Prompt From File - EQX'
+        Name of the node whose ``inputs.seed`` should be incremented.
+
+    Returns
+    -------
+    int | None
+        The new seed value or *None* if the node/seed was not found.
+    """
+
+    data = json.loads(Path(path).read_text())
+
+    target_node = None
+    for node_id, node in data.items():
+        if isinstance(node, dict) and node.get("class_type") == node_class:
+            target_node = node
+            break
+
+    if not target_node:
+        return None
+
+    inputs = target_node.get("inputs", {})
+    seed_val = inputs.get("seed")
+    if isinstance(seed_val, int):
+        new_seed = seed_val + 1
+        inputs["seed"] = new_seed
+        Path(path).write_text(json.dumps(data, indent=2))
+        return new_seed
+    return None 
