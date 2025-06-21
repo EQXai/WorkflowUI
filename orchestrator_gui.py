@@ -1,6 +1,8 @@
 import os
 import time
 import json
+import math
+import random
 from pathlib import Path
 from typing import List, Dict, Any
 
@@ -8,6 +10,7 @@ import gradio as gr
 from PIL import Image
 import shutil
 import tempfile
+import numpy as np  # NEW: for beep sound generation
 
 # Local modules
 import orchestrator as oc  # our previously created orchestrator.py
@@ -15,8 +18,18 @@ import orchestrator as oc  # our previously created orchestrator.py
 # Constants
 DEFAULT_OUTPUT_DIR = Path(oc.DEFAULT_OUTPUT_DIR)
 
+# Directory where preset JSON files will be stored
+PRESET_DIR = Path(__file__).resolve().parent / "save_presets"
+PRESET_DIR.mkdir(parents=True, exist_ok=True)
+
 # Extra constants for advanced check configuration
 from run_checks import CATEGORY_DISPLAY_MAPPINGS, DEFAULT_NSFW_CATEGORIES
+
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+
+MAX_SEED_VALUE = 10_000_000  # Upper limit for any seed value
 
 # -------------------------------------------------------------
 # Dynamic form helpers for workflow editing
@@ -30,13 +43,51 @@ WF2_MAPPING: list[tuple[str, str, type]] = []
 # Flag used to signal cancellation from the GUI
 CANCEL_REQUESTED = False
 
+# External seed counter that persists across pipeline invocations while the
+# application is running. It is only used when the user selects the
+# "Incremental" seed mode.
+GLOBAL_SEED_COUNTER: int | None = None
+
+# Global counters for statistics
+GLOBAL_APPROVED_COUNT = 0
+GLOBAL_REJECTED_COUNT = 0
+
+# Placeholder beep generator -------------------------------------------------
+
+AUDIO_FILE = Path(__file__).resolve().parent / "audio" / "notify.mp3" # New constant
+
+def _get_notification_sound():
+    """Return a sound reference accepted by gr.Audio: filepath if exists else tuple(sr, arr)."""
+    if AUDIO_FILE.exists():
+        return str(AUDIO_FILE)
+    # fallback beep
+    duration = 0.6
+    freq = 880
+    sr = 44100
+    t = np.linspace(0, duration, int(sr*duration), False, dtype=np.float32)
+    tone = 0.25 * np.sin(2 * np.pi * freq * t)
+    return sr, tone.astype(np.float32)
+
 def _request_cancel():
+    """Triggered by Cancel button: stop execution and update indicators."""
     global CANCEL_REQUESTED
     CANCEL_REQUESTED = True
-    return "Cancellation requested. Finishing current step…"
+    return (
+        "Pending: 0",
+        "Cancelled",
+        f"Approved: {GLOBAL_APPROVED_COUNT} | Rejected: {GLOBAL_REJECTED_COUNT}",
+        str(AUDIO_FILE) if AUDIO_FILE.exists() else None,
+    )
 
-def _build_workflow_editor(json_path: str):
+# -------------------------------------------------------------
+# Workflow editor builder
+# -------------------------------------------------------------
+
+def _build_workflow_editor(json_path: str, highlight_ids: list[str] | None = None):
     """Return (components, mapping) for the workflow located at *json_path*.
+
+    If *highlight_ids* is provided, the indicated node IDs will appear first in
+    the UI (useful for quick access to frequently-edited parameters).
 
     components: list of Gradio components created.
     mapping: list of tuples (node_id, input_key, original_type) in the same order
@@ -50,23 +101,18 @@ def _build_workflow_editor(json_path: str):
     comps: list = []
     mapping: list[tuple[str, str, type]] = []
 
-    # Sort nodes by numeric id for determinism when possible
-    def _node_sort(k):
-        try:
-            return int(k)
-        except Exception:
-            return k
+    highlight_set = {str(i) for i in (highlight_ids or [])}
 
-    for node_id in sorted(data.keys(), key=_node_sort):
-        node = data[node_id]
-        if not isinstance(node, dict):
-            continue
+    # Helper to add UI components for a single node -------------------------
+    def _add_node(node_id: str):
+        node = data.get(node_id)
+        if not node or not isinstance(node, dict):
+            return
         inputs = node.get("inputs")
         if not inputs:
-            continue
+            return
 
         with gr.Accordion(f"{node_id} – {node.get('class_type', '')}", open=False):
-            # iterate over inputs in stable order
             for key, val in inputs.items():
                 # choose component type heuristically
                 if isinstance(val, bool):
@@ -79,6 +125,25 @@ def _build_workflow_editor(json_path: str):
 
                 comps.append(comp)
                 mapping.append((node_id, key, type(val)))
+
+    # First pass: highlighted nodes rendered inside a yellow box -----------
+    if highlight_ids:
+        with gr.Column(elem_classes=["highlight-box"]):
+            gr.Markdown("**Highlighted nodes** (frequently edited):")
+            for hid in highlight_ids:
+                _add_node(str(hid))
+
+    # Second pass: remaining nodes sorted for determinism -------------------
+    def _node_sort(k):
+        try:
+            return int(k)
+        except Exception:
+            return k
+
+    for node_id in sorted(data.keys(), key=_node_sort):
+        if node_id in highlight_set:
+            continue  # already added
+        _add_node(node_id)
 
     return comps, mapping
 
@@ -136,6 +201,15 @@ CSS = """
     width: 100% !important;
     height: auto !important;
 }
+
+/* Highlight container for featured nodes */
++.highlight-box {
+    border: 3px solid #f8e71c !important; /* bright yellow */
+    background-color: rgba(248, 231, 28, 0.05); /* subtle yellow tint */
+    padding: 10px !important;
+    margin-bottom: 12px !important;
+    border-radius: 6px;
+}
 """
 
 # -----------------------------------------------------------------------------
@@ -160,36 +234,41 @@ def run_pipeline_gui(
     output_dir_str: str,
     final_dir_str: str,
     batch_runs: int,
+    endless_until_cancel: bool,
+    play_sound: bool,
+    seed_mode: str,
+    seed_counter_input: int | float,
+    override_save_name: bool,
+    save_name_base: str,
+    load_prompts_directly: bool,
+    prompt_list_str: str,
+    characteristics_text: str,
     *dynamic_values: bool | str,
 ):
     """Function executed by the Gradio UI. Returns tuple of outputs."""
-    # Ensure at least 1 run (number of desired successful images)
-    batch_runs = max(1, int(batch_runs))
+    global GLOBAL_APPROVED_COUNT, GLOBAL_REJECTED_COUNT
 
-    # 1. Determine selected checks
-    checks: List[str] = []
-    if do_nsfw:
-        checks.append("nsfw")
-    if do_face_count:
-        checks.append("face_count")
-    if do_partial_face:
-        checks.append("partial_face")
+    def _metrics_str():
+        return f"Approved: {GLOBAL_APPROVED_COUNT} | Rejected: {GLOBAL_REJECTED_COUNT}"
 
-    if not checks:
-        return None, {}, "You must select at least one check.", None, "In Queue: 0"
+    def _pending_str(pend):
+        return f"Pending: {pend}"
 
-    output_dir = Path(output_dir_str) if output_dir_str else DEFAULT_OUTPUT_DIR
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # This variable will hold either None (no sound) or (sr, arr)
+    sound_placeholder: str | tuple[int, np.ndarray] | None = None
 
-    final_dir = Path(final_dir_str) if final_dir_str else Path.home() / "ComfyUI" / "final"
-    final_dir.mkdir(parents=True, exist_ok=True)
+    def _boxes(pend):
+        return (
+            _pending_str(pend),
+            status_str,
+            _metrics_str(),
+            sound_placeholder,
+        )
 
-    log_lines: List[str] = []
+    status_str = "Idle"
 
-    # Album de imágenes generadas (solo las que superan los checks)
-    album_images: List[Image.Image] = []
-
-    global CANCEL_REQUESTED
+    # Status helper ---------------------------------------------------------
+    global CANCEL_REQUESTED, GLOBAL_SEED_COUNTER
     CANCEL_REQUESTED = False  # reset at start of each invocation
 
     # Split dynamic_values into nsfw category toggles and workflow edits
@@ -198,7 +277,40 @@ def run_pipeline_gui(
     wf_edit_values = dynamic_values[num_nsfw_cats:]
 
     wf1_edit_vals = wf_edit_values[: len(WF1_MAPPING)]
-    wf2_edit_vals = wf_edit_values[len(WF1_MAPPING) :]
+    wf2_edit_vals = wf_edit_values[len(WF1_MAPPING) : len(WF1_MAPPING)+len(WF2_MAPPING)]
+    remaining_vals = wf_edit_values[len(WF1_MAPPING)+len(WF2_MAPPING):]
+
+    # Extract LoRA override values --------------------------------------------------
+    override_loras_flag = False
+    lora_paths: list[str] = [""]*6
+    lora_strength_vals: list[float] = [0.7,0.3,0.3,0.3,0.3,0.3]
+    if remaining_vals:
+        override_loras_flag = bool(remaining_vals[0])
+        # expect 12 additional entries
+        if len(remaining_vals) >= 13:
+            lora_paths = [str(v).strip() for v in remaining_vals[1:7]]
+            lora_strength_vals = [float(v) for v in remaining_vals[7:13]]
+
+    # ----------------------------------------------------------------------
+    # If the user enabled direct prompt loading, create a temporary prompts
+    # file and inject its path into the workflow (node class
+    # "Load Prompt From File - EQX", expected id 190).
+    # ----------------------------------------------------------------------
+
+    tmp_prompt_file: str | None = None
+    if load_prompts_directly:
+        prompt_list_clean = (prompt_list_str or "").strip()
+        if not prompt_list_clean:
+            # Nothing to load – fail fast with message
+            return None, {}, "Prompt list is empty while the direct prompt option is enabled.", None, "In Queue: 0", "Error", _metrics_str(), None
+
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix="_prompts.txt")
+            os.close(tmp_fd)
+            Path(tmp_path).write_text(prompt_list_clean)
+            tmp_prompt_file = tmp_path
+        except Exception as e:
+            return None, {}, f"Could not create temporary prompt file: {e}", None, "In Queue: 0", "Error", _metrics_str(), None
 
     # ----------------------------------------------------------------------
     # Build modified workflow copies according to edits (only once at start
@@ -209,45 +321,160 @@ def run_pipeline_gui(
     wf1_path_mod = _apply_edits_to_workflow(oc.WORKFLOW1_JSON, WF1_MAPPING, wf1_edit_vals)
     wf2_path_mod = _apply_edits_to_workflow(oc.WORKFLOW2_JSON, WF2_MAPPING, wf2_edit_vals)
 
-    target_successes = batch_runs
+    # --------------------------------------------------
+    # Apply LoRA overrides if enabled
+    # --------------------------------------------------
+    if override_loras_flag:
+        try:
+            data_wf2 = json.loads(Path(wf2_path_mod).read_text())
+            for nid in ("244", "307"):
+                node = data_wf2.get(nid)
+                if node and isinstance(node, dict):
+                    for i in range(1,7):
+                        path_val = lora_paths[i-1]
+                        strength_val = lora_strength_vals[i-1]
+                        # Only override if user provided a path
+                        if path_val:
+                            node.setdefault("inputs", {})[f"lora_{i}"] = {
+                                "on": True,
+                                "lora": path_val,
+                                "strength": strength_val,
+                            }
+            Path(wf2_path_mod).write_text(json.dumps(data_wf2, indent=2))
+        except Exception as e:
+            log_lines.append(f"[WARN] Could not apply LoRA overrides: {e}")
+
+    # When using direct prompt loading, patch node 190's file_path to our temp file
+    if load_prompts_directly and tmp_prompt_file:
+        def _set_prompt_file(path_json: str, file_path: str, node_class: str = "Load Prompt From File - EQX") -> bool:
+            try:
+                data_local = json.loads(Path(path_json).read_text())
+                for node in data_local.values():
+                    if isinstance(node, dict) and node.get("class_type") == node_class:
+                        node.setdefault("inputs", {})["file_path"] = str(file_path)
+                        Path(path_json).write_text(json.dumps(data_local, indent=2))
+                        return True
+            except Exception:
+                pass
+            return False
+
+        _set_prompt_file(wf1_path_mod, tmp_prompt_file)
+
+    if characteristics_text and characteristics_text.strip():
+        try:
+            data_local = json.loads(Path(wf1_path_mod).read_text())
+            if "171" in data_local:
+                data_local["171"].setdefault("inputs", {})["text"] = characteristics_text.strip()
+                Path(wf1_path_mod).write_text(json.dumps(data_local, indent=2))
+        except Exception as e:
+            log_lines.append(f"[WARN] Could not set characteristics text for node 171: {e}")
+
     success_count = 0
     attempt = 0
 
-    while success_count < target_successes:
+    # Determine the target number of successful images. If "endless" mode is
+    # enabled we will iterate until the user presses **Cancel** from the UI.
+    if endless_until_cancel:
+        target_successes = math.inf
+        # keep a sane default for batch_runs to avoid type issues later on
+        batch_runs = max(1, int(batch_runs)) if batch_runs is not None else 1
+    else:
+        batch_runs = max(1, int(batch_runs))
+        target_successes = batch_runs
+
+    # 1. Determine selected checks --------------------------------------------------
+    checks: List[str] = []
+    if do_nsfw:
+        checks.append("nsfw")
+    if do_face_count:
+        checks.append("face_count")
+    if do_partial_face:
+        checks.append("partial_face")
+
+    if not checks:
+        return None, {}, "You must select at least one check.", None, "In Queue: 0", "Error", _metrics_str(), None
+
+    # Prepare output directories --------------------------------------------
+    output_dir = Path(output_dir_str) if output_dir_str else DEFAULT_OUTPUT_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    final_dir = Path(final_dir_str) if final_dir_str else Path.home() / "ComfyUI" / "final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+
+    log_lines: List[str] = []
+
+    # Album of generated images that pass checks
+    album_images: List[Image.Image] = []
+
+    while True:
+        # Stop when the requested amount is reached (unless endless mode)
+        if not endless_until_cancel and success_count >= target_successes:
+            break
+
+        # Check if user requested cancellation from the UI
         if CANCEL_REQUESTED:
             log_lines.append("[CANCEL] Execution cancelled by user.")
+            status_str = "Cancelled"
             current_log = "\n\n".join(log_lines)
-            pending = max(0, target_successes - success_count)
-            yield None, current_log, None, album_images, f"In Queue: {pending}"
+            pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
+            yield None, current_log, None, album_images, *_boxes(pending)
             break
 
         attempt += 1
         # Separador visual entre intentos
         if attempt > 1:
             log_lines.append("")  # línea en blanco
+        total_target = "∞" if endless_until_cancel else target_successes
         log_lines.append(
-            f"========== ATTEMPT {attempt} | Passed {success_count}/{target_successes} =========="
+            f"========== ATTEMPT {attempt} | Passed {success_count}/{total_target} =========="
         )
+
+        # ------------------------------------------------------------------
+        # Prepare seed according to the selected mode
+        # ------------------------------------------------------------------
+        def _set_seed(path: str, value: int, node_class: str = "Load Prompt From File - EQX") -> bool:
+            try:
+                data = json.loads(Path(path).read_text())
+                for node in data.values():
+                    if isinstance(node, dict) and node.get("class_type") == node_class:
+                        node.setdefault("inputs", {})["seed"] = int(value)
+                        Path(path).write_text(json.dumps(data, indent=2))
+                        return True
+            except Exception:
+                pass
+            return False
+
+        current_seed_val: int | None = None
+        if seed_mode.lower().startswith("incre"):
+            # Initialise counter only the first time we use it.
+            if GLOBAL_SEED_COUNTER is None:
+                GLOBAL_SEED_COUNTER = int(seed_counter_input) % (MAX_SEED_VALUE + 1)
+            current_seed_val = GLOBAL_SEED_COUNTER
+            GLOBAL_SEED_COUNTER = (GLOBAL_SEED_COUNTER + 1) % (MAX_SEED_VALUE + 1)
+        elif seed_mode.lower().startswith("rand"):
+            current_seed_val = random.randint(0, MAX_SEED_VALUE)
+        else:  # Fallback to the value typed by the user (static)
+            current_seed_val = min(int(seed_counter_input), MAX_SEED_VALUE)
+
+        if _set_seed(wf1_path_mod, current_seed_val):
+            log_lines.append(f"[SEED] Using seed {current_seed_val} (mode: {seed_mode})")
+        else:
+            log_lines.append("[SEED] Warning: could not locate seed node to update")
 
         # ------------------------------------------------------------------
         # Run Workflow 1
         # ------------------------------------------------------------------
         log_lines.append("[WF1] Running Workflow1…")
+        status_str = "Generating (WF1)"
         start_time = time.time()
         try:
-            from orchestrator import increment_seed_in_workflow
-            new_seed = increment_seed_in_workflow(wf1_path_mod)
-            if new_seed is not None:
-                log_lines.append(f"[SEED] Updated seed to {new_seed}")
-            else:
-                log_lines.append("[SEED] Warning: could not update seed (node not found)")
             oc.run_workflow(wf1_path_mod)
         except Exception as e:
             err_msg = f"Error while executing Workflow1: {e}"
             log_lines.append(err_msg)
             current_log = "\n\n".join(log_lines)
-            pending = max(0, target_successes - success_count)
-            yield None, current_log, None, album_images, f"Pendientes: {pending}"
+            pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
+            yield None, current_log, None, album_images, *_boxes(pending)
             continue
 
         wf1_img_path = oc.newest_file(output_dir, after=start_time)
@@ -255,8 +482,8 @@ def run_pipeline_gui(
             err_msg = "Could not find the resulting image from Workflow1."
             log_lines.append(err_msg)
             current_log = "\n\n".join(log_lines)
-            pending = max(0, target_successes - success_count)
-            yield None, current_log, None, album_images, f"Pendientes: {pending}"
+            pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
+            yield None, current_log, None, album_images, *_boxes(pending)
             continue
 
         wf1_img_pil = _load_img(wf1_img_path)
@@ -265,8 +492,8 @@ def run_pipeline_gui(
 
         # Show WF1 image immediately
         current_log = "\n\n".join(log_lines)
-        pending = max(0, target_successes - success_count)
-        yield wf1_img_pil, current_log, None, album_images, f"Pendientes: {pending}"
+        pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
+        yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
 
         # ----------------------------------------------------------------------
         # Build optional parameters for run_checks according to UI
@@ -277,6 +504,11 @@ def run_pipeline_gui(
             allowed_categories = {cat_keys[i] for i, checked in enumerate(nsfw_categories) if checked}
 
         log_lines.append("[CHECK] Running external checks…")
+        status_str = "Checks"
+        # Yield before running checks so UI reflects status change
+        current_log = "\n\n".join(log_lines)
+        pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
+        yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
         try:
             results = oc.run_checks(
                 wf1_img_path,
@@ -289,15 +521,15 @@ def run_pipeline_gui(
             err_msg = f"Error while executing checks: {e}"
             log_lines.append(err_msg)
             current_log = "\n\n".join(log_lines)
-            pending = max(0, target_successes - success_count)
-            yield wf1_img_pil, current_log, None, album_images, f"Pendientes: {pending}"
+            pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
+            yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
             continue
 
         log_lines.append(f"[CHECK] Results: {json.dumps(results, indent=2, ensure_ascii=False)}")
 
         current_log = "\n\n".join(log_lines)
-        pending = max(0, target_successes - success_count)
-        yield wf1_img_pil, current_log, None, album_images, f"Pendientes: {pending}"
+        pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
+        yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
 
         # -----------------------------
         failed = False
@@ -314,10 +546,18 @@ def run_pipeline_gui(
             log_lines.append("[CHECK] Partial face detected and stop option is active.")
 
         if failed:
+            # Delete the generated file to save disk space
+            try:
+                Path(wf1_img_path).unlink(missing_ok=True)
+            except Exception as e:
+                log_lines.append(f"[CLEANUP] Could not delete failed image: {e}")
+
             # La ejecución se considera fallida; no incrementamos success_count
+            global GLOBAL_REJECTED_COUNT
+            GLOBAL_REJECTED_COUNT += 1
             current_log = "\n\n".join(log_lines)
-            pending = max(0, target_successes - success_count)
-            yield wf1_img_pil, current_log, None, album_images, f"Pendientes: {pending}"
+            pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
+            yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
             continue
 
         # ----------------------------------------------------------------------
@@ -330,6 +570,10 @@ def run_pipeline_gui(
             shutil.copy(wf1_img_path, verified_path)
 
         log_lines.append("[WF2] Running Workflow2…")
+        status_str = "Generating (WF2)"
+        current_log = "\n\n".join(log_lines)
+        pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
+        yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
         start_time2 = time.time()
         overrides = {oc.LOAD_NODE_ID_WF2: {"image": str(verified_path)}}
         try:
@@ -338,8 +582,8 @@ def run_pipeline_gui(
             err_msg = f"Error while executing Workflow2: {e}"
             log_lines.append(err_msg)
             current_log = "\n\n".join(log_lines)
-            pending = max(0, target_successes - success_count)
-            yield wf1_img_pil, current_log, None, album_images, f"Pendientes: {pending}"
+            pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
+            yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
             continue
 
         wf2_img_path = oc.newest_file(output_dir, after=start_time2)
@@ -347,8 +591,8 @@ def run_pipeline_gui(
             err_msg = "Could not find the resulting image from Workflow2."
             log_lines.append(err_msg)
             current_log = "\n\n".join(log_lines)
-            pending = max(0, target_successes - success_count)
-            yield wf1_img_pil, current_log, None, album_images, f"Pendientes: {pending}"
+            pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
+            yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
             continue
 
         wf2_img_pil = _load_img(wf2_img_path)
@@ -357,20 +601,62 @@ def run_pipeline_gui(
         # Add the approved final image to the album and display
         album_images.append(wf2_img_pil)
 
+        status_str = "Completed"
+
         current_log = "\n\n".join(log_lines)
-        pending = max(0, target_successes - success_count)
-        yield wf1_img_pil, current_log, wf2_img_pil, album_images, f"Pendientes: {pending}"
+        pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
+        yield wf1_img_pil, current_log, wf2_img_pil, album_images, *_boxes(pending)
+
+        # Extract base filename from node 175 (ShowText) for this attempt
+        def _extract_filename_base(path_json: str) -> str | None:
+            try:
+                data_json = json.loads(Path(path_json).read_text())
+                val = data_json.get("175", {}).get("inputs", {}).get("text_0")
+                if isinstance(val, str) and val.strip():
+                    # keep only safe filename chars
+                    import re
+                    safe = re.sub(r"[^A-Za-z0-9._-]", "_", val.strip())
+                    return safe[:255]
+            except Exception:
+                pass
+            return None
+
+        default_filename_base = _extract_filename_base(wf1_path_mod)
 
         try:
-            final_path = final_dir / wf2_img_path.name
+            if override_save_name and save_name_base.strip():
+                base = Path(save_name_base.strip()).stem  # sanitize
+                # find next available index
+                idx = 1
+                while (final_dir / f"{base}_{idx}.png").exists():
+                    idx += 1
+                final_path = final_dir / f"{base}_{idx}.png"
+            elif default_filename_base:
+                base = default_filename_base
+                idx = 1
+                while (final_dir / f"{base}_{idx}.png").exists():
+                    idx += 1
+                final_path = final_dir / f"{base}_{idx}.png"
+            else:
+                final_path = final_dir / wf2_img_path.name
             shutil.copy(wf2_img_path, final_path)
         except Exception as e:
             log_lines.append(f"Warning: could not copy final image to {final_path}: {e}")
 
         # Si llegamos aquí la imagen pasó todos los filtros ⇒ contamos como éxito
         success_count += 1
+        global GLOBAL_APPROVED_COUNT
+        GLOBAL_APPROVED_COUNT += 1
 
         # end loop iteration
+
+    # end of while loop -----------------------------------------------------
+    # Send final update so indicators show the correct counts (pending=0)
+    sound_placeholder = _get_notification_sound() if play_sound else None
+
+    final_pending = 0
+    final_log = "\n\n".join(log_lines)
+    yield None, final_log, None, album_images, *_boxes(final_pending)
 
     return
 
@@ -390,8 +676,25 @@ def launch_gui():
             """
         )
 
+        # -------------------- Preset section at top ----------------------
+        with gr.Accordion("Configuration Presets", open=False):
+            with gr.Row():
+                preset_name_txt = gr.Textbox(label="Preset name")
+                save_preset_btn = gr.Button("Save Preset")
+            with gr.Row():
+                presets_dd = gr.Dropdown(label="Available presets", choices=[p.stem for p in PRESET_DIR.glob("*.json")])
+                load_preset_btn = gr.Button("Load Preset")
+                refresh_presets_btn = gr.Button("Refresh List")
+                reset_btn = gr.Button("Reset to defaults")
+
+        # ----------------------------------------------------------------
+
         run_btn = gr.Button("Run Pipeline", variant="primary")
-        pending_box = gr.Markdown("Pendientes: 0", elem_id="pending-box", elem_classes=["pending-box"])
+        cancel_btn = gr.Button("Cancel", variant="stop")
+        with gr.Row():
+            pending_box = gr.Markdown("Pending: 0", elem_id="pending-box", elem_classes=["pending-box"])
+            status_box = gr.Markdown("Idle", elem_id="status-box", elem_classes=["pending-box"])
+            metrics_box = gr.Markdown("Approved: 0 | Rejected: 0", elem_id="metrics-box", elem_classes=["pending-box"])
 
         with gr.Row():
             with gr.Column(scale=1):
@@ -431,6 +734,7 @@ def launch_gui():
                         0.8,
                         step=0.05,
                         label="Face detection confidence",
+                        info="Higher requires stronger face match to pass (0.1-1.0)"
                     )
 
                     margin_slider = gr.Slider(
@@ -439,42 +743,133 @@ def launch_gui():
                         0.5,
                         step=0.1,
                         label="Partial face margin",
+                        info="How much extra margin around face is allowed before considered partial"
                     )
 
-                    batch_runs_slider = gr.Slider(
-                        minimum=1,
-                        maximum=20,
-                        value=1,
-                        step=1,
-                        label="Number of runs",
+                    # End of Checks accordion
+
+                # --------------------------------------------------
+                # Execution settings (batch + seed) – outside Checks accordion
+                # --------------------------------------------------
+                with gr.Accordion("Execution Settings", open=False):
+                    with gr.Row():
+                        with gr.Column():
+                            batch_runs_input = gr.Number(
+                                value=1,
+                                minimum=1,
+                                precision=0,
+                                label="Batch Runs",
+                                info="Number of successful final images to generate when not in endless mode"
+                            )
+
+                            endless_until_cancel_cb = gr.Checkbox(
+                                label="Endless until cancel", value=False
+                            )
+
+                            play_sound_cb = gr.Checkbox(
+                                label="Play sound when batch completes", value=True,
+                            )
+
+                        with gr.Column():
+                            seed_mode_radio = gr.Radio(
+                                choices=["Incremental", "Random", "Static"],
+                                value="Incremental",
+                                label="Seed mode",
+                            )
+                            seed_counter_input = gr.Number(
+                                value=0,
+                                minimum=0,
+                                maximum=MAX_SEED_VALUE,
+                                precision=0,
+                                label="Initial/Current Seed (<= 10,000,000)",
+                                info="Starting seed for Incremental mode or static seed if using Static mode"
+                            )
+
+                    # Custom filename ---------------------------------------------------
+                    with gr.Accordion("Custom final filename", open=False):
+                        override_filename_cb = gr.Checkbox(label="Override final filename", value=False)
+                        filename_text = gr.Textbox(label="Base filename", value="final_image")
+
+                    # Node 171 – ttN text override -------------------------------------
+                    characteristics_text = gr.Textbox(
+                        label="Replace this with the characteristics of each girl",
+                        lines=3,
+                        value="A photo of GeegeeDwa1 posing next to a white chair. She has long darkbrown hair styled in pigtails and very pale skin. She wears a vibrant sexy outfit. Her expression is a smirk. The background shows a modern apartment that exudes a candid atmosphere.",
                     )
 
-                    pass  # directory inputs finished
+                    # NEW: Direct Prompt Loader -----------------------------------------
+                    with gr.Accordion("Load Prompt list Manually", open=False):
+                        load_prompts_cb = gr.Checkbox(label="Enable direct prompt list", value=False)
+                        prompts_textbox = gr.Textbox(
+                            label="Prompt list (format: {{{id}}}{{positive}}{negative}, …)",
+                            lines=4,
+                            placeholder="{{{title}}}{{positive}}{negative}, …",
+                            visible=False,
+                        )
+
+                        # Toggle visibility of the prompt textbox
+                        load_prompts_cb.change(lambda x: gr.update(visible=x), inputs=[load_prompts_cb], outputs=[prompts_textbox])
+
+                    # --- NEW: LoRA Overrides -----------------------
+                    override_loras_cb = gr.Checkbox(
+                         label="Override LoRA settings (nodes 244 & 307)", value=False,
+                    )
+
+                    with gr.Column(visible=False) as lora_override_col:
+                        gr.Markdown("**LoRA Overrides** – Enter only the filename or relative path inside the `lora/` folder. Leave blank to keep the workflow default settings.")
+                        lora_inputs = []
+                        lora_strengths = []
+                        for idx in range(1,7):
+                            with gr.Row():
+                                txt = gr.Textbox(label=f"lora_{idx} path", placeholder="KimberlyMc1.safetensors")
+                                default_strength = 0.7 if idx==1 else 0.3
+                                sl = gr.Slider(0.0,1.5,default_strength,step=0.05,label="strength")
+                            lora_inputs.append(txt)
+                            lora_strengths.append(sl)
+
+                    # toggle visibility
+                    override_loras_cb.change(lambda v: gr.update(visible=v), inputs=override_loras_cb, outputs=lora_override_col)
+
+                pass  # directory inputs finished
 
             with gr.Column(scale=3):
+                # First row: both workflow images side by side
                 with gr.Row(equal_height=True):
                     wf1_img_out = gr.Image(
                         label="Workflow 1 Image",
                         interactive=False,
-                        height=512,
+                        height=400,
                         elem_classes=["preview-img"],
                     )
                     wf2_img_out = gr.Image(
                         label="Workflow 2 Image",
                         interactive=False,
-                        height=512,
+                        height=400,
                         elem_classes=["preview-img"],
                     )
 
-        with gr.Row():
-            log_text = gr.Textbox(label="Log", lines=15, scale=1)
+                # Second row: log (left) and gallery (right)
+                with gr.Row():
+                    log_text = gr.Textbox(label="Log", lines=18, scale=1)
 
-            album_gallery = gr.Gallery(
-                label="Results",
-                columns=[1, 2, 3, 4],  # responsive: mobile→1, desktop→2-4 columns
-                elem_id="results-gallery",
-                scale=1,
-            )
+                    try:
+                        from gradio.components import Carousel  # Gradio >=4
+                        album_gallery = Carousel(
+                            label="Results",
+                            visible=True,
+                            scale=2,
+                        )
+                    except ImportError:
+                        # Fallback to Gallery (older Gradio)
+                        album_gallery = gr.Gallery(
+                            label="Results",
+                            columns=[4],
+                            preview=False,
+                            elem_id="results-gallery",
+                            scale=2,
+                        )
+
+                    sound_audio = gr.Audio(label="Sound", autoplay=True, visible=False)
 
         # Dynamic workflow editors ------------------------------------------------
 
@@ -484,7 +879,97 @@ def launch_gui():
             wf1_components, WF1_MAPPING = _build_workflow_editor(str(oc.WORKFLOW1_JSON))
 
         with gr.Tab("Workflow 2 Config"):
-            wf2_components, WF2_MAPPING = _build_workflow_editor(str(oc.WORKFLOW2_JSON))
+            # Highlight node 248 for quick access
+            wf2_components, WF2_MAPPING = _build_workflow_editor(
+                str(oc.WORKFLOW2_JSON), highlight_ids=["248"]
+            )
+
+        # Build list of all configurable components in the exact input order
+        ALL_COMPONENTS = [
+            do_nsfw_cb,
+            do_face_count_cb,
+            do_partial_face_cb,
+            stop_multi_faces_cb,
+            stop_partial_face_cb,
+            confidence_slider,
+            margin_slider,
+            output_dir_input,
+            final_dir_input,
+            batch_runs_input,
+            endless_until_cancel_cb,
+            play_sound_cb,
+            seed_mode_radio,
+            seed_counter_input,
+            override_filename_cb,
+            filename_text,
+            characteristics_text,
+            load_prompts_cb,
+            prompts_textbox,
+            *nsfw_cat_checkboxes,
+            *wf1_components,
+            *wf2_components,
+            override_loras_cb,
+            *lora_inputs,
+            *lora_strengths,
+        ]
+
+        DEFAULT_VALUES = [c.value for c in ALL_COMPONENTS]
+
+        # --------------------------------------------------
+        # Preset callbacks
+        # --------------------------------------------------
+        def _save_preset(*vals):
+            *cfg_vals, preset_name = vals
+            preset_name = preset_name.strip()
+            if not preset_name:
+                return gr.update()
+            path = PRESET_DIR / f"{preset_name}.json"
+            with open(path, "w") as f:
+                json.dump(cfg_vals, f)
+            choices = [p.stem for p in PRESET_DIR.glob("*.json")]
+            return gr.update(choices=choices, value=preset_name)
+
+        def _load_preset(selected_name):
+            if not selected_name:
+                return DEFAULT_VALUES
+            path = PRESET_DIR / f"{selected_name}.json"
+            if not path.exists():
+                return DEFAULT_VALUES
+            try:
+                cfg_vals = json.loads(path.read_text())
+                # safeguard length mismatch
+                if len(cfg_vals) != len(ALL_COMPONENTS):
+                    return DEFAULT_VALUES
+                return cfg_vals
+            except Exception:
+                return DEFAULT_VALUES
+
+        def _reset_defaults():
+            return DEFAULT_VALUES
+
+        save_preset_btn.click(_save_preset, inputs=[*ALL_COMPONENTS, preset_name_txt], outputs=[presets_dd])
+        load_preset_btn.click(_load_preset, inputs=[presets_dd], outputs=ALL_COMPONENTS)
+        refresh_presets_btn.click(lambda: gr.update(choices=[p.stem for p in PRESET_DIR.glob("*.json")]), outputs=[presets_dd])
+        reset_btn.click(_reset_defaults, outputs=ALL_COMPONENTS)
+
+        # -------------------- Validation -----------------------
+        def _validate(*vals):
+            (
+                nsfw,
+                face_count,
+                partial_face,
+                batch_runs_val,
+            ) = vals
+            has_check = nsfw or face_count or partial_face
+            ok_batch = (batch_runs_val or 0) >= 1
+            return gr.update(interactive=bool(has_check and ok_batch))
+
+        for comp in [do_nsfw_cb, do_face_count_cb, do_partial_face_cb, batch_runs_input]:
+            comp.change(
+                _validate,
+                inputs=[do_nsfw_cb, do_face_count_cb, do_partial_face_cb, batch_runs_input],
+                outputs=[run_btn],
+            )
 
         # Prepare inputs list in the same order expected by run_pipeline_gui
         run_btn.click(
@@ -499,13 +984,37 @@ def launch_gui():
                 margin_slider,
                 output_dir_input,
                 final_dir_input,
-                batch_runs_slider,
+                batch_runs_input,
+                endless_until_cancel_cb,
+                play_sound_cb,
+                seed_mode_radio,
+                seed_counter_input,
+                override_filename_cb,
+                filename_text,
+                load_prompts_cb,
+                prompts_textbox,
+                characteristics_text,
                 *nsfw_cat_checkboxes,
                 *wf1_components,
                 *wf2_components,
+                override_loras_cb,
+                *lora_inputs,
+                *lora_strengths,
             ],
-            outputs=[wf1_img_out, log_text, wf2_img_out, album_gallery, pending_box],
+            outputs=[
+                wf1_img_out,
+                log_text,
+                wf2_img_out,
+                album_gallery,
+                pending_box,
+                status_box,
+                metrics_box,
+                sound_audio,
+            ],
         )
+
+        # Wire the cancel button so that it sets the global flag and updates the pending box
+        cancel_btn.click(fn=_request_cancel, outputs=[pending_box, status_box, metrics_box, sound_audio])
 
     demo.queue().launch(server_name="0.0.0.0", server_port=18188, share=True)
 
