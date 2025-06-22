@@ -31,6 +31,9 @@ from run_checks import CATEGORY_DISPLAY_MAPPINGS, DEFAULT_NSFW_CATEGORIES
 
 MAX_SEED_VALUE = 10_000_000  # Upper limit for any seed value
 
+# NEW: Maximum number of images kept in the on-screen gallery
+MAX_GALLERY_IMAGES = 20  # Only the last 20 approved images will be shown
+
 # -------------------------------------------------------------
 # Dynamic form helpers for workflow editing
 # -------------------------------------------------------------
@@ -281,15 +284,34 @@ def run_pipeline_gui(
     remaining_vals = wf_edit_values[len(WF1_MAPPING)+len(WF2_MAPPING):]
 
     # Extract LoRA override values --------------------------------------------------
-    override_loras_flag = False
-    lora_paths: list[str] = [""]*6
-    lora_strength_vals: list[float] = [0.7,0.3,0.3,0.3,0.3,0.3]
-    if remaining_vals:
-        override_loras_flag = bool(remaining_vals[0])
-        # expect 12 additional entries
-        if len(remaining_vals) >= 13:
-            lora_paths = [str(v).strip() for v in remaining_vals[1:7]]
-            lora_strength_vals = [float(v) for v in remaining_vals[7:13]]
+    # New layout (flags removed):
+    #  [0:6]   -> 6 LoRA paths for node 244
+    #  [6:12]  -> 6 strength values for node 244
+    #  [12:18] -> 6 paths for node 307
+    #  [18:24] -> 6 strengths for node 307
+
+    override_loras_244_flag = False
+    override_loras_307_flag = False
+
+    lora244_paths: list[str] = [""] * 6
+    lora244_strengths: list[float] = [0.7, 0.3, 0.3, 0.3, 0.3, 0.3]
+
+    lora307_paths: list[str] = [""] * 6
+    lora307_strengths: list[float] = [0.7, 0.3, 0.3, 0.3, 0.3, 0.3]
+
+    if remaining_vals and len(remaining_vals) >= 24:
+        idx = 0
+        lora244_paths = [str(v).strip() for v in remaining_vals[idx:idx+6]]; idx += 6
+        lora244_strengths = [float(v) for v in remaining_vals[idx:idx+6]]; idx += 6
+
+        lora307_paths = [str(v).strip() for v in remaining_vals[idx:idx+6]]; idx += 6
+        lora307_strengths = [float(v) for v in remaining_vals[idx:idx+6]]
+
+        override_loras_244_flag = any(p for p in lora244_paths)
+        override_loras_307_flag = any(p for p in lora307_paths)
+
+    # initialise log list early so we can safely append warnings before main loop
+    log_lines: List[str] = []
 
     # ----------------------------------------------------------------------
     # If the user enabled direct prompt loading, create a temporary prompts
@@ -322,24 +344,33 @@ def run_pipeline_gui(
     wf2_path_mod = _apply_edits_to_workflow(oc.WORKFLOW2_JSON, WF2_MAPPING, wf2_edit_vals)
 
     # --------------------------------------------------
-    # Apply LoRA overrides if enabled
+    # Apply LoRA overrides if the user enabled either panel
     # --------------------------------------------------
-    if override_loras_flag:
+    if override_loras_244_flag or override_loras_307_flag:
         try:
             data_wf2 = json.loads(Path(wf2_path_mod).read_text())
-            for nid in ("244", "307"):
-                node = data_wf2.get(nid)
-                if node and isinstance(node, dict):
-                    for i in range(1,7):
-                        path_val = lora_paths[i-1]
-                        strength_val = lora_strength_vals[i-1]
-                        # Only override if user provided a path
-                        if path_val:
-                            node.setdefault("inputs", {})[f"lora_{i}"] = {
-                                "on": True,
-                                "lora": path_val,
-                                "strength": strength_val,
-                            }
+
+            # Helper to patch a single node
+            def _patch_node(node_id: str, paths: list[str], strengths: list[float]):
+                node = data_wf2.get(node_id)
+                if not (node and isinstance(node, dict)):
+                    return
+                for i in range(1, 7):
+                    path_val = paths[i - 1]
+                    strength_val = strengths[i - 1]
+                    if path_val:  # Only override if user provided a path
+                        node.setdefault("inputs", {})[f"lora_{i}"] = {
+                            "on": True,
+                            "lora": path_val,
+                            "strength": strength_val,
+                        }
+
+            if override_loras_244_flag:
+                _patch_node("244", lora244_paths, lora244_strengths)
+
+            if override_loras_307_flag:
+                _patch_node("307", lora307_paths, lora307_strengths)
+
             Path(wf2_path_mod).write_text(json.dumps(data_wf2, indent=2))
         except Exception as e:
             log_lines.append(f"[WARN] Could not apply LoRA overrides: {e}")
@@ -368,6 +399,18 @@ def run_pipeline_gui(
                 Path(wf1_path_mod).write_text(json.dumps(data_local, indent=2))
         except Exception as e:
             log_lines.append(f"[WARN] Could not set characteristics text for node 171: {e}")
+
+    # ----------------------------------------------------------------------
+    # DEBUG: Save final workflow JSONs sent to ComfyUI ----------------------
+    # ----------------------------------------------------------------------
+    try:
+        debug_dir = Path(__file__).resolve().parent / "WF_debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        shutil.copy(wf1_path_mod, debug_dir / f"WF1_{ts}.json")
+        shutil.copy(wf2_path_mod, debug_dir / f"WF2_{ts}.json")
+    except Exception as e:
+        log_lines.append(f"[WARN] Could not save debug workflow JSONs: {e}")
 
     success_count = 0
     attempt = 0
@@ -400,8 +443,6 @@ def run_pipeline_gui(
 
     final_dir = Path(final_dir_str) if final_dir_str else Path.home() / "ComfyUI" / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
-
-    log_lines: List[str] = []
 
     # Album of generated images that pass checks
     album_images: List[Image.Image] = []
@@ -457,9 +498,16 @@ def run_pipeline_gui(
             current_seed_val = min(int(seed_counter_input), MAX_SEED_VALUE)
 
         if _set_seed(wf1_path_mod, current_seed_val):
-            log_lines.append(f"[SEED] Using seed {current_seed_val} (mode: {seed_mode})")
+            log_lines.append(f"[SEED] Using seed {current_seed_val} (mode: {seed_mode}) for prompt loader")
         else:
-            log_lines.append("[SEED] Warning: could not locate seed node to update")
+            log_lines.append("[SEED] Warning: could not locate prompt seed node (Load Prompt From File - EQX) to update")
+
+        # NEW: randomise the seed used by the KSampler via the 'Seed Everywhere' node (id 189)
+        image_seed_val = random.randint(0, MAX_SEED_VALUE)
+        if _set_seed(wf1_path_mod, image_seed_val, node_class="Seed Everywhere"):
+            log_lines.append(f"[SEED] Using random image seed {image_seed_val} for KSampler (Seed Everywhere)")
+        else:
+            log_lines.append("[SEED] Warning: could not locate 'Seed Everywhere' node to update")
 
         # ------------------------------------------------------------------
         # Run Workflow 1
@@ -601,6 +649,10 @@ def run_pipeline_gui(
         # Add the approved final image to the album and display
         album_images.append(wf2_img_pil)
 
+        # NEW: keep gallery size bounded to the last MAX_GALLERY_IMAGES
+        if len(album_images) > MAX_GALLERY_IMAGES:
+            album_images = album_images[-MAX_GALLERY_IMAGES:]
+
         status_str = "Completed"
 
         current_log = "\n\n".join(log_lines)
@@ -657,6 +709,9 @@ def run_pipeline_gui(
     final_pending = 0
     final_log = "\n\n".join(log_lines)
     yield None, final_log, None, album_images, *_boxes(final_pending)
+
+    # (global mappings are updated during GUI construction; do not reassign
+    # them here to avoid Python's local-variable shadowing.)
 
     return
 
@@ -785,19 +840,31 @@ def launch_gui():
                                 info="Starting seed for Incremental mode or static seed if using Static mode"
                             )
 
+                    # NEW: Settings Override ---------------------------------------------------
+                    # Settings Override moved to a dedicated full-width section below.
+                    # Variables declared here so they exist before later usage.
+                    override_components: list = []
+                    WF1_OVERRIDE_MAPPING: list[tuple[str, str, type]] = []
+                    override_components2: list = []
+                    WF2_OVERRIDE_MAPPING: list[tuple[str, str, type]] = []
+
+                    # ----------------------------------------------------------------
+                    # Additional execution overrides (kept inside Execution Settings)
+                    # ----------------------------------------------------------------
+
                     # Custom filename ---------------------------------------------------
                     with gr.Accordion("Custom final filename", open=False):
                         override_filename_cb = gr.Checkbox(label="Override final filename", value=False)
                         filename_text = gr.Textbox(label="Base filename", value="final_image")
 
-                    # Node 171 – ttN text override -------------------------------------
+                    # Node 171 – Characteristics text override ---------------------------
                     characteristics_text = gr.Textbox(
                         label="Replace this with the characteristics of each girl",
                         lines=3,
                         value="A photo of GeegeeDwa1 posing next to a white chair. She has long darkbrown hair styled in pigtails and very pale skin. She wears a vibrant sexy outfit. Her expression is a smirk. The background shows a modern apartment that exudes a candid atmosphere.",
                     )
 
-                    # NEW: Direct Prompt Loader -----------------------------------------
+                    # Direct Prompt Loader ----------------------------------------------
                     with gr.Accordion("Load Prompt list Manually", open=False):
                         load_prompts_cb = gr.Checkbox(label="Enable direct prompt list", value=False)
                         prompts_textbox = gr.Textbox(
@@ -810,27 +877,10 @@ def launch_gui():
                         # Toggle visibility of the prompt textbox
                         load_prompts_cb.change(lambda x: gr.update(visible=x), inputs=[load_prompts_cb], outputs=[prompts_textbox])
 
-                    # --- NEW: LoRA Overrides -----------------------
-                    override_loras_cb = gr.Checkbox(
-                         label="Override LoRA settings (nodes 244 & 307)", value=False,
-                    )
-
-                    with gr.Column(visible=False) as lora_override_col:
-                        gr.Markdown("**LoRA Overrides** – Enter only the filename or relative path inside the `lora/` folder. Leave blank to keep the workflow default settings.")
-                        lora_inputs = []
-                        lora_strengths = []
-                        for idx in range(1,7):
-                            with gr.Row():
-                                txt = gr.Textbox(label=f"lora_{idx} path", placeholder="KimberlyMc1.safetensors")
-                                default_strength = 0.7 if idx==1 else 0.3
-                                sl = gr.Slider(0.0,1.5,default_strength,step=0.05,label="strength")
-                            lora_inputs.append(txt)
-                            lora_strengths.append(sl)
-
-                    # toggle visibility
-                    override_loras_cb.change(lambda v: gr.update(visible=v), inputs=override_loras_cb, outputs=lora_override_col)
-
                 pass  # directory inputs finished
+
+                # Log textbox (below all accordions)
+                log_text = gr.Textbox(label="Log", lines=18, interactive=False)
 
             with gr.Column(scale=3):
                 # First row: both workflow images side by side
@@ -848,21 +898,18 @@ def launch_gui():
                         elem_classes=["preview-img"],
                     )
 
-                # Second row: log (left) and gallery (right)
+                # Second row: gallery only
                 with gr.Row():
-                    log_text = gr.Textbox(label="Log", lines=18, scale=1)
-
                     try:
                         from gradio.components import Carousel  # Gradio >=4
                         album_gallery = Carousel(
-                            label="Results",
+                            label="Results (last 20)",
                             visible=True,
                             scale=2,
                         )
                     except ImportError:
-                        # Fallback to Gallery (older Gradio)
                         album_gallery = gr.Gallery(
-                            label="Results",
+                            label="Results (last 20)",
                             columns=[4],
                             preview=False,
                             elem_id="results-gallery",
@@ -873,16 +920,233 @@ def launch_gui():
 
         # Dynamic workflow editors ------------------------------------------------
 
+        # Workflow editors removed; keep mapping lists for override only
         global WF1_MAPPING, WF2_MAPPING
+        wf1_components = []
+        wf2_components = []
+        WF1_MAPPING = WF1_OVERRIDE_MAPPING
+        WF2_MAPPING = globals().get("WF2_OVERRIDE_MAPPING", [])
 
-        with gr.Tab("Workflow 1 Config"):
-            wf1_components, WF1_MAPPING = _build_workflow_editor(str(oc.WORKFLOW1_JSON))
+        # ---------------- Settings Override (Full Width) ----------------
+        with gr.Accordion("Settings Override", open=False):
+            override_components = []
+            override_components2 = []
+            WF1_OVERRIDE_MAPPING = []
+            WF2_OVERRIDE_MAPPING = []
 
-        with gr.Tab("Workflow 2 Config"):
-            # Highlight node 248 for quick access
-            wf2_components, WF2_MAPPING = _build_workflow_editor(
-                str(oc.WORKFLOW2_JSON), highlight_ids=["248"]
-            )
+            # Helpers -------------------------------------------------
+            try:
+                wf1_data = json.loads(Path(oc.WORKFLOW1_JSON).read_text())
+            except Exception:
+                wf1_data = {}
+
+            try:
+                wf2_data = json.loads(Path(oc.WORKFLOW2_JSON).read_text())
+            except Exception:
+                wf2_data = {}
+
+            def _def_val(node: dict | None, key: str, fallback: Any = None):
+                if node and isinstance(node, dict):
+                    return node.get("inputs", {}).get(key, fallback)
+                return fallback
+
+            def _num(label: str, value: int | float | None = None):
+                return gr.Number(label=label, value=value if value is not None else 0, precision=0)
+
+            # Layout: two columns side by side -----------------------
+            with gr.Row():
+                # ---------------- LEFT: Workflow 1 -----------------
+                with gr.Column(scale=1):
+                    gr.Markdown("### Workflow 1 Overrides")
+
+                    # 168 – Steps KSampler 1
+                    n168 = wf1_data.get("168", {})
+                    comp_168 = _num("Steps KSampler 1 - 168", _def_val(n168, "steps", 20))
+                    override_components.append(comp_168)
+                    WF1_OVERRIDE_MAPPING.append(("168", "steps", int))
+
+                    # 169 – Steps KSampler 2
+                    n169 = wf1_data.get("169", {})
+                    comp_169 = _num("Steps KSampler 2 - 169", _def_val(n169, "steps", 20))
+                    override_components.append(comp_169)
+                    WF1_OVERRIDE_MAPPING.append(("169", "steps", int))
+
+                    # 170 – Prefix Title Text
+                    n170 = wf1_data.get("170", {})
+                    comp_170 = gr.Textbox(label="Prefix Title Text - 170", value=_def_val(n170, "text", ""))
+                    override_components.append(comp_170)
+                    WF1_OVERRIDE_MAPPING.append(("170", "text", str))
+
+                    # 173 – Checkpoint
+                    n173 = wf1_data.get("173", {})
+                    comp_173 = gr.Textbox(label="Checkpoint - 173", value=_def_val(n173, "ckpt_name", ""))
+                    override_components.append(comp_173)
+                    WF1_OVERRIDE_MAPPING.append(("173", "ckpt_name", str))
+
+                    # 176 – Width & Height
+                    gr.Markdown("**Width & Height - 176**")
+                    with gr.Row():
+                        comp_176_w = _num("Width", _def_val(n176 := wf1_data.get("176", {}), "width", 512))
+                        comp_176_h = _num("Height", _def_val(n176, "height", 512))
+                    override_components.extend([comp_176_w, comp_176_h])
+                    WF1_OVERRIDE_MAPPING.extend([
+                        ("176", "width", int),
+                        ("176", "height", int),
+                    ])
+
+                    # 180 – Text 180
+                    n180 = wf1_data.get("180", {})
+                    comp_180 = gr.Textbox(label="Text - 180", value=_def_val(n180, "text", ""))
+                    override_components.append(comp_180)
+                    WF1_OVERRIDE_MAPPING.append(("180", "text", str))
+
+                    # 182 – Steps KSampler 3
+                    n182 = wf1_data.get("182", {})
+                    comp_182 = _num("Steps KSampler 3 - 182", _def_val(n182, "steps", 20))
+                    override_components.append(comp_182)
+                    WF1_OVERRIDE_MAPPING.append(("182", "steps", int))
+
+                # ---------------- RIGHT: Workflow 2 ----------------
+                with gr.Column(scale=1):
+                    gr.Markdown("### Workflow 2 Overrides")
+
+                    def _num2(label: str, value: int | float | None = None):
+                        return gr.Number(label=label, value=value if value is not None else 0)
+
+                    # 248 – Text 248
+                    n248 = wf2_data.get("248", {})
+                    comp_248 = gr.Textbox(label="Text – 248", value=_def_val(n248, "text", ""))
+                    override_components2.append(comp_248)
+                    WF2_OVERRIDE_MAPPING.append(("248", "text", str))
+
+                    # 224 – Guidance
+                    n224 = wf2_data.get("224", {})
+                    comp_224 = _num2("Guidance", _def_val(n224, "guidance", 7.0))
+                    override_components2.append(comp_224)
+                    WF2_OVERRIDE_MAPPING.append(("224", "guidance", float))
+
+                    # 226 – Grain power
+                    n226 = wf2_data.get("226", {})
+                    comp_226 = _num2("Grain power", _def_val(n226, "grain_power", 1.0))
+                    override_components2.append(comp_226)
+                    WF2_OVERRIDE_MAPPING.append(("226", "grain_power", float))
+
+                    # 230 – Max Size
+                    n230 = wf2_data.get("230", {})
+                    comp_230 = _num2("Max Size", _def_val(n230, "size", 1024))
+                    override_components2.append(comp_230)
+                    WF2_OVERRIDE_MAPPING.append(("230", "size", int))
+
+                    # 239 – Steps & Denoise
+                    n239 = wf2_data.get("239", {})
+                    comp_239_steps = _num2("Steps – 239", _def_val(n239, "steps", 20))
+                    comp_239_denoise = _num2("Denoise – 239", _def_val(n239, "denoise", 0.2))
+                    override_components2.extend([comp_239_steps, comp_239_denoise])
+                    WF2_OVERRIDE_MAPPING.extend([
+                        ("239", "steps", int),
+                        ("239", "denoise", float),
+                    ])
+
+                    # 242 – CR Prompt Test 242
+                    n242 = wf2_data.get("242", {})
+                    comp_242 = gr.Textbox(label="CR Prompt Test – 242", value=_def_val(n242, "prompt", ""))
+                    override_components2.append(comp_242)
+                    WF2_OVERRIDE_MAPPING.append(("242", "prompt", str))
+
+                    # 243 – CR Prompt Test 243
+                    n243 = wf2_data.get("243", {})
+                    comp_243 = gr.Textbox(label="CR Prompt Test – 243", value=_def_val(n243, "prompt", ""))
+                    override_components2.append(comp_243)
+                    WF2_OVERRIDE_MAPPING.append(("243", "prompt", str))
+
+                    # 287 – Guidance 287
+                    n287 = wf2_data.get("287", {})
+                    comp_287 = _num2("Guidance – 287", _def_val(n287, "guidance", 7.0))
+                    override_components2.append(comp_287)
+                    WF2_OVERRIDE_MAPPING.append(("287", "guidance", float))
+
+                    # 289 – Grain power 289
+                    n289 = wf2_data.get("289", {})
+                    comp_289 = _num2("Grain power – 289", _def_val(n289, "grain_power", 1.0))
+                    override_components2.append(comp_289)
+                    WF2_OVERRIDE_MAPPING.append(("289", "grain_power", float))
+
+                    # 293 – Max size 293
+                    n293 = wf2_data.get("293", {})
+                    comp_293 = _num2("Max size - 293", _def_val(n293, "size", 1024))
+                    override_components2.append(comp_293)
+                    WF2_OVERRIDE_MAPPING.append(("293", "size", int))
+
+                    # 302 – Steps & Denoise 302
+                    n302 = wf2_data.get("302", {})
+                    comp_302_steps = _num2("Steps – 302", _def_val(n302, "steps", 20))
+                    comp_302_denoise = _num2("Denoise – 302", _def_val(n302, "denoise", 0.2))
+                    override_components2.extend([comp_302_steps, comp_302_denoise])
+                    WF2_OVERRIDE_MAPPING.extend([
+                        ("302", "steps", int),
+                        ("302", "denoise", float),
+                    ])
+
+                    # 305 – Prompt 305
+                    n305 = wf2_data.get("305", {})
+                    comp_305 = gr.Textbox(label="Prompt – 305", value=_def_val(n305, "prompt", ""))
+                    override_components2.append(comp_305)
+                    WF2_OVERRIDE_MAPPING.append(("305", "prompt", str))
+
+                    # 306 – Prompt 306
+                    n306 = wf2_data.get("306", {})
+                    comp_306 = gr.Textbox(label="Prompt – 306", value=_def_val(n306, "prompt", ""))
+                    override_components2.append(comp_306)
+                    WF2_OVERRIDE_MAPPING.append(("306", "prompt", str))
+
+                    # 311 – Text 311
+                    n311 = wf2_data.get("311", {})
+                    comp_311 = gr.Textbox(label="Text – 311", value=_def_val(n311, "text", ""))
+                    override_components2.append(comp_311)
+                    WF2_OVERRIDE_MAPPING.append(("311", "text", str))
+
+            # Update globals and mappings -------------------------------
+            WF1_MAPPING = WF1_OVERRIDE_MAPPING
+            WF2_MAPPING = WF2_OVERRIDE_MAPPING
+
+            globals().update({
+                "override_components": override_components,
+                "override_components2": override_components2,
+                "WF1_OVERRIDE_MAPPING": WF1_OVERRIDE_MAPPING,
+                "WF2_OVERRIDE_MAPPING": WF2_OVERRIDE_MAPPING,
+            })
+
+        # ---------------- LoRA OVERRIDES ----------------
+        with gr.Accordion("LoRA Overrides (nodes 244 & 307)", open=False):
+            with gr.Row():
+                # Node 244 --------------------------------------------------
+                with gr.Column(scale=1):
+                    gr.Markdown("### Node 244 – LoRA list")
+                    lora244_inputs = []
+                    lora244_strengths = []
+                    for idx in range(1, 7):
+                        with gr.Row():
+                            txt = gr.Textbox(label=f"lora_{idx} path", placeholder="KimberlyMc1.safetensors")
+                            default_strength = 0.7 if idx == 1 else 0.3
+                            sl = gr.Slider(0.0, 1.5, default_strength, step=0.05, label="strength")
+                        lora244_inputs.append(txt)
+                        lora244_strengths.append(sl)
+
+                # Node 307 --------------------------------------------------
+                with gr.Column(scale=1):
+                    gr.Markdown("### Node 307 – LoRA list")
+                    lora307_inputs = []
+                    lora307_strengths = []
+                    for idx in range(1, 7):
+                        with gr.Row():
+                            txt = gr.Textbox(label=f"lora_{idx} path", placeholder="KimberlyMc1.safetensors")
+                            default_strength = 0.7 if idx == 1 else 0.3
+                            sl = gr.Slider(0.0, 1.5, default_strength, step=0.05, label="strength")
+                        lora307_inputs.append(txt)
+                        lora307_strengths.append(sl)
+
+        # -------------------------------------------------------------------
+        # Dynamic workflow editors ------------------------------------------------
 
         # Build list of all configurable components in the exact input order
         ALL_COMPONENTS = [
@@ -902,15 +1166,16 @@ def launch_gui():
             seed_counter_input,
             override_filename_cb,
             filename_text,
-            characteristics_text,
             load_prompts_cb,
             prompts_textbox,
+            characteristics_text,
             *nsfw_cat_checkboxes,
-            *wf1_components,
-            *wf2_components,
-            override_loras_cb,
-            *lora_inputs,
-            *lora_strengths,
+            *override_components,
+            *override_components2,
+            *lora244_inputs,
+            *lora244_strengths,
+            *lora307_inputs,
+            *lora307_strengths,
         ]
 
         DEFAULT_VALUES = [c.value for c in ALL_COMPONENTS]
@@ -995,11 +1260,12 @@ def launch_gui():
                 prompts_textbox,
                 characteristics_text,
                 *nsfw_cat_checkboxes,
-                *wf1_components,
-                *wf2_components,
-                override_loras_cb,
-                *lora_inputs,
-                *lora_strengths,
+                *override_components,
+                *override_components2,
+                *lora244_inputs,
+                *lora244_strengths,
+                *lora307_inputs,
+                *lora307_strengths,
             ],
             outputs=[
                 wf1_img_out,
