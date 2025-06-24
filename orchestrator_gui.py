@@ -29,7 +29,7 @@ from run_checks import CATEGORY_DISPLAY_MAPPINGS, DEFAULT_NSFW_CATEGORIES
 # Constants
 # -----------------------------------------------------------------------------
 
-MAX_SEED_VALUE = 10_000_000  # Upper limit for any seed value
+MAX_SEED_VALUE = 18446744073709551615  # Upper limit for any seed value (uint64 max)
 
 # NEW: Maximum number of images kept in the on-screen gallery
 MAX_GALLERY_IMAGES = 20  # Only the last 20 approved images will be shown
@@ -660,20 +660,118 @@ def run_pipeline_gui(
         yield wf1_img_pil, current_log, wf2_img_pil, album_images, *_boxes(pending)
 
         # Extract base filename from node 175 (ShowText) for this attempt
-        def _extract_filename_base(path_json: str) -> str | None:
+        def _extract_filename_base(wf1_json: str, wf2_json: str) -> str | None:
+            """Build a filename base using several nodes that influence it.
+
+            Priority order:
+            1. The *filename_prefix* defined in the SaveImage node from Workflow 2.
+               If that field is a link to another node we extract its **text** input.
+            2. The *text_0* value from node **175** (ShowText) of Workflow 1.
+            3. Fallback to None if no text could be gathered.
+
+            When both prefix and the suffix defined in the SaveImage node are
+            available, the result becomes "{prefix}{delimiter}{suffix}".  All
+            characters not safe for filenames are replaced with "_" and the
+            total length is capped to 255 characters.
+            """
+
+            import re
+
+            def _safe(txt: str) -> str:
+                return re.sub(r"[^A-Za-z0-9._-]", "_", txt.strip()) if txt else ""
+
+            # 0. Prefix coming from node 190 (Load Prompt From File)
+
+            prefix: str | None = None
             try:
-                data_json = json.loads(Path(path_json).read_text())
-                val = data_json.get("175", {}).get("inputs", {}).get("text_0")
-                if isinstance(val, str) and val.strip():
-                    # keep only safe filename chars
-                    import re
-                    safe = re.sub(r"[^A-Za-z0-9._-]", "_", val.strip())
-                    return safe[:255]
+                data_wf1_seed = json.loads(Path(wf1_json).read_text())
+                node190 = data_wf1_seed.get("190", {})
+                if isinstance(node190.get("inputs"), dict):
+                    txt_path = node190["inputs"].get("file_path")
+                    seed_val = node190["inputs"].get("seed")
+                    if isinstance(txt_path, str) and Path(txt_path).exists() and isinstance(seed_val, int):
+                        lines = Path(txt_path).read_text(encoding="utf-8", errors="ignore").splitlines()
+                        if lines:
+                            idx = seed_val % len(lines)
+                            raw_line = lines[idx].strip()
+                            import re as _re
+                            m = _re.match(r"\{\{\{([^}]+)\}\}\}", raw_line)
+                            if m:
+                                prefix = m.group(1)
             except Exception:
                 pass
-            return None
 
-        default_filename_base = _extract_filename_base(wf1_path_mod)
+            # 2. Fallback to ShowText (175) if no prefix yet
+            if prefix is None:
+                try:
+                    data_wf1_bt = json.loads(Path(wf1_json).read_text())
+                    v175 = data_wf1_bt.get("175", {}).get("inputs", {}).get("text_0")
+                    if isinstance(v175, str) and v175.strip():
+                        prefix = v175.strip()
+                except Exception:
+                    pass
+
+            # 1. Parse Workflow 2 – SaveImage node for suffix / delimiter
+            suffix: str | None = None
+            delim = "_"
+
+            try:
+                data_wf2 = json.loads(Path(wf2_json).read_text())
+                save_node = None
+                for n in data_wf2.values():
+                    if isinstance(n, dict) and isinstance(n.get("class_type"), str):
+                        if n["class_type"].lower().startswith("saveimage"):
+                            save_node = n
+                            break
+
+                if save_node and isinstance(save_node.get("inputs"), dict):
+                    inputs_si = save_node["inputs"]
+
+                    # Delimiter override
+                    if isinstance(inputs_si.get("filename_delimiter"), str):
+                        delim = inputs_si["filename_delimiter"] or "_"
+
+                    # Helper to resolve value or reference
+                    def _resolve(val):
+                        if isinstance(val, str):
+                            return val
+                        if (
+                            isinstance(val, list)
+                            and len(val) >= 1
+                            and isinstance(val[0], (str, int))
+                        ):
+                            ref_id = str(val[0])
+                            ref_node = data_wf2.get(ref_id, {})
+                            if isinstance(ref_node.get("inputs"), dict):
+                                cand = (
+                                    ref_node["inputs"].get("text")
+                                    or ref_node["inputs"].get("text_0")
+                                )
+                                if isinstance(cand, str):
+                                    return cand
+                        return None
+
+                    # We purposefully *ignore* filename_prefix from SaveImage,
+                    # because the user requested using node 190 output instead.
+                    suffix = _resolve(inputs_si.get("filename_suffix")) or None
+            except Exception:
+                pass
+
+            # Decide final base parts --------------------------------------
+            parts = []
+            if prefix and prefix.strip():
+                parts.append(prefix.strip())
+
+            if suffix and suffix.strip():
+                parts.append(suffix.strip())
+
+            if not parts:
+                return None
+
+            filename_base = delim.join(_safe(p) for p in parts if p.strip())
+            return filename_base[:255] if filename_base else None
+
+        default_filename_base = _extract_filename_base(wf1_path_mod, wf2_path_mod)
 
         try:
             if override_save_name and save_name_base.strip():
@@ -733,16 +831,169 @@ def launch_gui():
 
         # -------------------- Preset section at top ----------------------
         with gr.Accordion("Configuration Presets", open=False):
-            with gr.Row():
-                preset_name_txt = gr.Textbox(label="Preset name")
-                save_preset_btn = gr.Button("Save Preset")
-            with gr.Row():
-                presets_dd = gr.Dropdown(label="Available presets", choices=[p.stem for p in PRESET_DIR.glob("*.json")])
-                load_preset_btn = gr.Button("Load Preset")
-                refresh_presets_btn = gr.Button("Refresh List")
-                reset_btn = gr.Button("Reset to defaults")
+            gr.Markdown(
+                """
+                **Preset Manager** – Save and organise full GUI configurations so they can later be reused from the
+                CLI.  Typical workflow:
 
-        # ----------------------------------------------------------------
+                1. Configure all options in the GUI.
+                2. Type a **Preset name** and click **Save/Overwrite**.
+                3. Use **Load** to restore a preset or **Delete / Rename** to manage the list.
+                4. **Export** downloads the selected preset as a JSON file (for backup or sharing).
+                5. **Import** lets you add an external JSON preset to the list.
+
+                Use the **Filter** box if you accumulate hundreds of presets – it performs a case-insensitive
+                substring match on preset names.
+                """
+            )
+
+            # -------- Two-column layout ---------------------------------
+            with gr.Row():
+                # ===== LEFT: list & filter =====
+                with gr.Column(scale=1):
+                    filter_txt = gr.Textbox(
+                        label="Search presets", 
+                        placeholder="Type to filter by name", 
+                        interactive=True,
+                    )
+
+                    # Always-visible list of presets
+                    presets_dd = gr.Radio(
+                        label="Available presets",
+                        choices=[p.stem for p in PRESET_DIR.glob("*.json")],
+                        interactive=True,
+                        info="Select a preset to load, rename, delete or export",
+                    )
+
+                # ===== RIGHT: create / rename / import =====
+                with gr.Column(scale=1):
+                    preset_name_txt = gr.Textbox(
+                        label="Preset name",
+                        placeholder="MyNewPreset",
+                        info="Create a new preset or overwrite an existing one",
+                    )
+                    save_preset_btn = gr.Button("Save / Overwrite")
+                    with gr.Row():
+                        load_preset_btn = gr.Button("Load")
+                        delete_preset_btn = gr.Button("Delete")
+                        export_btn = gr.Button("Export")
+                        reset_btn = gr.Button("Reset defaults")
+
+                    rename_txt = gr.Textbox(label="Rename to", placeholder="New name")
+                    rename_btn = gr.Button("Rename")
+                    gr.Markdown("**Import preset (.json)**")
+                    import_file = gr.File(
+                        label="Import file",
+                        file_types=[".json"],
+                        interactive=True,
+                    )
+
+            # Helper functions ----------------------------------
+            def _list_presets():
+                return sorted([p.stem for p in PRESET_DIR.glob("*.json")])
+
+            def _filter_presets(pattern: str):
+                pattern = (pattern or "").lower().strip()
+                names = _list_presets()
+                if not pattern:
+                    return names
+                return [n for n in names if pattern in n.lower()]
+
+            def _save_preset(*vals):
+                *cfg_vals, preset_name = vals
+                preset_name = preset_name.strip()
+                if not preset_name:
+                    return gr.update()
+                path = PRESET_DIR / f"{preset_name}.json"
+                with open(path, "w") as f:
+                    json.dump(cfg_vals, f)
+                choices = [p.stem for p in PRESET_DIR.glob("*.json")]
+                return gr.update(choices=choices, value=preset_name)
+
+            def _load_preset(selected_name):
+                if not selected_name:
+                    return DEFAULT_VALUES
+                path = PRESET_DIR / f"{selected_name}.json"
+                if not path.exists():
+                    return DEFAULT_VALUES
+                try:
+                    cfg_vals = json.loads(path.read_text())
+                    if len(cfg_vals) != len(ALL_COMPONENTS):
+                        return DEFAULT_VALUES
+                    return cfg_vals
+                except Exception:
+                    return DEFAULT_VALUES
+
+            def _delete_preset(name):
+                if not name:
+                    return gr.update()
+                path = PRESET_DIR / f"{name}.json"
+                if path.exists():
+                    path.unlink()
+                return gr.update(choices=_list_presets(), value=None)
+
+            def _rename_preset(old_name, new_name):
+                new_name = (new_name or "").strip()
+                if not old_name or not new_name:
+                    return gr.update()
+                src = PRESET_DIR / f"{old_name}.json"
+                dst = PRESET_DIR / f"{new_name}.json"
+                if src.exists():
+                    src.rename(dst)
+                return gr.update(choices=_list_presets(), value=new_name)
+
+            def _export_preset(name):
+                if not name:
+                    return None
+                return PRESET_DIR / f"{name}.json"
+
+            def _import_preset(file_obj):
+                if file_obj is None:
+                    return gr.update()
+                try:
+                    dst = PRESET_DIR / Path(file_obj.name).name
+                    shutil.copy(file_obj.name, dst)
+                except Exception:
+                    pass
+                return gr.update(choices=_list_presets(), value=dst.stem)
+
+            # --- Helper to return an update for the selector component ----
+            def _update_selector(selected: str | None):
+                return gr.update(choices=_list_presets(), value=selected)
+
+            # --- Filter button updates both selectors --------------------
+            filter_txt.change(
+                lambda txt: gr.update(choices=_filter_presets(txt), value=None),
+                inputs=[filter_txt],
+                outputs=[presets_dd],
+            )
+
+            # --- Sync list->dropdown so existing callbacks keep working ---
+            presets_dd.change(lambda x: x, inputs=[presets_dd], outputs=[presets_dd])
+
+            # --- Delete preset -------------------------------------------
+            delete_preset_btn.click(
+                lambda sel: _update_selector(None) if (_delete_preset(sel) or True) else gr.update(),
+                inputs=[presets_dd],
+                outputs=[presets_dd],
+            )
+
+            # --- Rename preset -------------------------------------------
+            rename_btn.click(
+                lambda old, new: _update_selector(new) if (_rename_preset(old, new) or True) else gr.update(),
+                inputs=[presets_dd, rename_txt],
+                outputs=[presets_dd],
+            )
+
+            # --- Export preset (unchanged, uses current selection) -------
+            export_btn.click(_export_preset, inputs=[presets_dd], outputs=[import_file])
+
+            # --- Import preset (returns update objects) ------------------
+            import_file.upload(
+                lambda f: _update_selector(None) if (_import_preset(f) or True) else gr.update(),
+                inputs=[import_file],
+                outputs=[presets_dd],
+            )
 
         run_btn = gr.Button("Run Pipeline", variant="primary")
         cancel_btn = gr.Button("Cancel", variant="stop")
@@ -836,7 +1087,7 @@ def launch_gui():
                                 minimum=0,
                                 maximum=MAX_SEED_VALUE,
                                 precision=0,
-                                label="Initial/Current Seed (<= 10,000,000)",
+                                label="Initial/Current Seed (<= 18446744073709551615)",
                                 info="Starting seed for Incremental mode or static seed if using Static mode"
                             )
 
@@ -1212,9 +1463,9 @@ def launch_gui():
         def _reset_defaults():
             return DEFAULT_VALUES
 
+        # Now that ALL_COMPONENTS is defined, wire callbacks that depend on it
         save_preset_btn.click(_save_preset, inputs=[*ALL_COMPONENTS, preset_name_txt], outputs=[presets_dd])
         load_preset_btn.click(_load_preset, inputs=[presets_dd], outputs=ALL_COMPONENTS)
-        refresh_presets_btn.click(lambda: gr.update(choices=[p.stem for p in PRESET_DIR.glob("*.json")]), outputs=[presets_dd])
         reset_btn.click(_reset_defaults, outputs=ALL_COMPONENTS)
 
         # -------------------- Validation -----------------------
@@ -1282,7 +1533,7 @@ def launch_gui():
         # Wire the cancel button so that it sets the global flag and updates the pending box
         cancel_btn.click(fn=_request_cancel, outputs=[pending_box, status_box, metrics_box, sound_audio])
 
-    demo.queue().launch(server_name="0.0.0.0", server_port=18188, share=True)
+    demo.queue().launch(server_name="0.0.0.0", server_port=18188, share=True, inbrowser=True)
 
 
 if __name__ == "__main__":

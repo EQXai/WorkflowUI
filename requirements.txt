@@ -9,3 +9,4 @@ nudenet>=2.0.2
 matplotlib>=3.7.1
 # PyTorch (torch, torchvision, torchaudio) se instalará por separado con soporte CUDA mediante setup_env.ps1
 onnxruntime>=1.16.3
+rich
