@@ -29,8 +29,11 @@ fi
 # shellcheck disable=SC1090
 source "$ENV_DIR/bin/activate"
 
+# Use the specified Python interpreter for all pip operations
+PIP="$PYTHON_BIN -m pip"
+
 printf "\033[36m[INFO] Upgrading pip...\033[0m\n"
-pip install --upgrade pip
+$PIP install --upgrade pip
 
 if [ ! -f requirements.txt ]; then
   printf "\033[31m[ERROR] requirements.txt not found in current directory.\033[0m\n" >&2
@@ -38,7 +41,7 @@ if [ ! -f requirements.txt ]; then
 fi
 
 printf "\033[36m[INFO] Installing dependencies from requirements.txt...\033[0m\n"
-pip install -r requirements.txt
+$PIP install -r requirements.txt
 
 # ---------------------------------------------------------------------------
 # (Re)install PyTorch according to detected CUDA version
@@ -46,7 +49,7 @@ pip install -r requirements.txt
 
 printf "\033[36m[INFO] Removing any existing PyTorch packages (torch, torchvision, torchaudio)...\033[0m\n"
 # Ignore errors if they are not installed yet
-pip uninstall -y torch torchvision torchaudio >/dev/null 2>&1 || true
+$PIP uninstall -y torch torchvision torchaudio >/dev/null 2>&1 || true
 
 # Detect CUDA version (try nvcc first, fallback to nvidia-smi)
 printf "\033[36m[INFO] Detecting CUDA version...\033[0m\n"
@@ -69,7 +72,7 @@ else
 fi
 
 printf "\033[36m[INFO] Installing PyTorch (torch, torchvision, torchaudio)...\033[0m\n"
-pip install torch torchvision torchaudio --index-url "$TORCH_INDEX_URL"
+$PIP install torch torchvision torchaudio --index-url "$TORCH_INDEX_URL"
 
 printf "\n\033[32m[SUCCESS] Environment setup completed.\033[0m\n"
 printf "\nTo activate the environment later run:\n  source %s/bin/activate\n" "$ENV_DIR" 

@@ -115,6 +115,7 @@ OVERRIDE_WF1 = [
     ("176", "height", int),
     ("180", "text", str),
     ("182", "steps", int),
+    ("190", "file_path", str),
 ]
 
 OVERRIDE_WF2 = [
@@ -133,7 +134,6 @@ OVERRIDE_WF2 = [
     ("302", "denoise", float),
     ("305", "prompt", str),
     ("306", "prompt", str),
-    ("311", "text", str),
 ]
 
 # Expose to orchestrator_gui so that run_pipeline_gui sees them
@@ -409,15 +409,26 @@ def _stream_pipeline_rich(values: List[Any], expected_runs: int | None, preset_n
                             
                     elif ln.startswith("[SEED]"):
                         _ensure_attempt(current_attempt)
-                        if "prompt" in ln.lower():
-                            m = re.search(r"seed (\d+)", ln)
-                            if m:
-                                attempts[current_attempt].prompt_seed = m.group(1)
-                        else:
-                            m = re.search(r"seed (\d+)", ln)
-                            if m:
-                                attempts[current_attempt].image_seed = m.group(1)
-                                
+                        lower_ln = ln.lower()
+                        # Extract the numeric value found AFTER the colon – this is
+                        # the actual seed we are interested in.
+                        m = re.search(r":\s*(\d+)", ln)
+                        if not m:
+                            # Nothing to capture → skip
+                            continue
+                        seed_val = m.group(1)
+
+                        # Distinguish the seed type based on the descriptive text
+                        if "prompt loader" in lower_ln:
+                            # Prompt seed (node 190)
+                            attempts[current_attempt].prompt_seed = seed_val
+                        elif "seed everywhere" in lower_ln:
+                            # Image seed coming from the *Seed Everywhere* node (189)
+                            attempts[current_attempt].image_seed = seed_val
+                        # Ignore the remaining noise_seed lines – they are not
+                        # displayed in the main table and would otherwise override
+                        # the image seed captured above.
+                        
                     elif ln.startswith("[CHECK] Results:"):
                         _ensure_attempt(current_attempt)
                         collecting_check[current_attempt] = [ln.split("Results:", 1)[1]]

@@ -65,6 +65,7 @@ OVERRIDE_WF1 = [
     ("176", "height", int),
     ("180", "text", str),
     ("182", "steps", int),
+    ("190", "file_path", str),
 ]
 
 OVERRIDE_WF2 = [
@@ -83,7 +84,6 @@ OVERRIDE_WF2 = [
     ("302", "denoise", float),
     ("305", "prompt", str),
     ("306", "prompt", str),
-    ("311", "text", str),
 ]
 
 # Expose to orchestrator_gui so that run_pipeline_gui sees them
@@ -265,31 +265,29 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None):
                             attempt_starts[current_attempt] = time.time()
                     elif ln.startswith("[SEED]"):
                         _ensure_attempt(current_attempt)
-                        if "prompt" in ln.lower():
-                            m = re.search(r"seed (\d+)", ln)
-                            if m:
-                                attempts[current_attempt]["PromptSeed"] = m.group(1)
-                        else:
-                            m = re.search(r"seed (\d+)", ln)
-                            if m:
-                                attempts[current_attempt]["ImageSeed"] = m.group(1)
+                        # Extract the numeric value that appears after the last ':'
+                        m = re.search(r":\s*(\d+)", ln)
+                        if not m:
+                            continue  # Skip if no number found
+                        seed_val = m.group(1)
+
+                        ln_lower = ln.lower()
+                        if "prompt" in ln_lower:
+                            # Prompt loader seed (node 190)
+                            attempts[current_attempt]["PromptSeed"] = seed_val
+                        elif "seed everywhere" in ln_lower and not attempts[current_attempt]["ImageSeed"].isdigit():
+                            # First occurrence corresponds to image seed (node 189)
+                            attempts[current_attempt]["ImageSeed"] = seed_val
                     elif ln.startswith("[CHECK] Results:"):
                         _ensure_attempt(current_attempt)
                         # Start collecting multiline JSON
                         collecting_check[current_attempt] = [ln.split("Results:",1)[1]]
-                    elif ln.startswith("[WF2] Image generated:"):
+                    elif ln.startswith("[FINAL] Image saved as:"):
                         _ensure_attempt(current_attempt)
-                        path = ln.split(":", 1)[1].strip()
-                        # Try to resolve final saved filename
-                        try:
-                            final_dir_arg = values[8] if len(values) > 8 and values[8] else str(Path.home()/"ComfyUI"/"final")
-                            fdir = Path(final_dir_arg).expanduser()
-                            latest = max(fdir.glob("*.png"), key=lambda p: p.stat().st_mtime)
-                            attempts[current_attempt]["SavedAs"] = latest.name
-                            if current_attempt in attempt_starts:
-                                attempts[current_attempt]["Duration"] = time.time() - attempt_starts[current_attempt]
-                        except Exception:
-                            attempts[current_attempt]["SavedAs"] = os.path.basename(path)
+                        saved_name = os.path.basename(ln.split(":", 1)[1].strip())
+                        attempts[current_attempt]["SavedAs"] = saved_name
+                        if current_attempt in attempt_starts and attempts[current_attempt].get("Duration") is None:
+                            attempts[current_attempt]["Duration"] = time.time() - attempt_starts[current_attempt]
                         attempts[current_attempt]["Status"] = "OK"
                     elif ln.startswith("[WF1] Running Workflow1"):
                         _ensure_attempt(current_attempt)

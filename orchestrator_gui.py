@@ -175,6 +175,21 @@ def _apply_edits_to_workflow(original_path: str, mapping: list[tuple[str, str, t
         except Exception:
             cast_val = val  # fallback to raw string
 
+        # Special case: resolve node 190 file_path relative to the "texts" folder
+        if node_id == "190" and key == "file_path":
+            # If value is not absolute, prepend the texts directory located next to this script
+            try:
+                from pathlib import Path as _P
+                _base = _P(__file__).resolve().parent / "texts"
+                _resolved = _P(cast_val)
+                if not _resolved.is_absolute():
+                    cast_val = str((_base / _resolved).resolve())
+                else:
+                    cast_val = str(_resolved)
+            except Exception:
+                # Fallback to original value if something goes wrong
+                pass
+
         if node_id in data and "inputs" in data[node_id]:
             data[node_id]["inputs"][key] = cast_val
 
@@ -281,10 +296,22 @@ def run_pipeline_gui(
 
     wf1_edit_vals = wf_edit_values[: len(WF1_MAPPING)]
     wf2_edit_vals = wf_edit_values[len(WF1_MAPPING) : len(WF1_MAPPING)+len(WF2_MAPPING)]
-    remaining_vals = wf_edit_values[len(WF1_MAPPING)+len(WF2_MAPPING):]
+
+    # -------------------------------------------------------------
+    # Parse extra LoRA controls: auto-fill checkbox & directory path
+    # -------------------------------------------------------------
+    extra_start = len(WF1_MAPPING) + len(WF2_MAPPING)
+    auto_lora_flag: bool = False
+    auto_lora_dir: str = ""
+
+    if len(wf_edit_values) >= extra_start + 2:
+        auto_lora_flag = bool(wf_edit_values[extra_start])
+        auto_lora_dir = str(wf_edit_values[extra_start + 1]).strip()
+
+    remaining_vals = wf_edit_values[extra_start + 2:]
 
     # Extract LoRA override values --------------------------------------------------
-    # New layout (flags removed):
+    # Layout (after the two extra fields):
     #  [0:6]   -> 6 LoRA paths for node 244
     #  [6:12]  -> 6 strength values for node 244
     #  [12:18] -> 6 paths for node 307
@@ -310,8 +337,113 @@ def run_pipeline_gui(
         override_loras_244_flag = any(p for p in lora244_paths)
         override_loras_307_flag = any(p for p in lora307_paths)
 
-    # initialise log list early so we can safely append warnings before main loop
-    log_lines: List[str] = []
+    # --------------------------------------------------
+    # Auto-fill LoRA lists from directory if requested
+    # --------------------------------------------------
+    if auto_lora_flag and auto_lora_dir:
+        try:
+            dir_path = Path(auto_lora_dir).expanduser().resolve()
+            if not dir_path.is_dir():
+                raise FileNotFoundError(f"Directory not found: {dir_path}")
+
+            # Collect all .safetensors files (recursive)
+            all_files = sorted(dir_path.rglob("*.safetensors"))
+            if not all_files:
+                raise FileNotFoundError("No .safetensors files found in directory.")
+
+            # Identify flux realism file for lora_1
+            flux_file = None
+            for p in all_files:
+                if p.name.lower() == "flux_realism_lora.safetensors":
+                    flux_file = p
+                    break
+
+            # Helper to convert absolute path to relative from 'lora/'
+            def _rel_from_lora(p: Path) -> str:
+                parts = list(p.parts)
+                if "lora" in parts:
+                    idx = parts.index("lora")
+                    rel = Path(*parts[idx+1:])
+                    return str(rel)
+                return p.name  # fallback: just filename
+
+            if flux_file is not None:
+                rel_flux = _rel_from_lora(flux_file)
+                lora244_paths[0] = rel_flux
+                lora307_paths[0] = rel_flux
+            else:
+                # leave slot empty but note warning
+                pass
+
+            # Prepare pool excluding flux_file
+            pool = [p for p in all_files if p != flux_file]
+            random.shuffle(pool)
+
+            selected = pool[:10]
+            # Fill node 244 slots 2-6 (index 1-5)
+            for i in range(5):
+                if i < len(selected):
+                    lora244_paths[i+1] = _rel_from_lora(selected[i])
+            # Fill node 307 slots 2-6
+            for i in range(5):
+                idx_sel = i + 5
+                if idx_sel < len(selected):
+                    lora307_paths[i+1] = _rel_from_lora(selected[idx_sel])
+
+            override_loras_244_flag = True
+            override_loras_307_flag = True
+        except Exception as e_auto:
+            # Log warning but do not fail pipeline
+            pass
+
+    # Initialise log list early so we can safely append warnings **and**
+    # mirror them to the terminal.  Using a tiny helper class avoids touching
+    # every individual `log_lines.append(...)` throughout the function.
+
+    from datetime import datetime as _dt
+
+    def _fmt_console(line: str) -> str:
+        """Return *line* prettified for console consumption.
+
+        1. Adds HH:MM:SS timestamp.
+        2. Ensures a blank line before each ATTEMPT separator for clarity.
+        3. Indents secondary messages to highlight the overall flow.
+        """
+
+        ts = _dt.now().strftime("%H:%M:%S")
+
+        if line.startswith("========== ATTEMPT"):
+            # visual separation between attempts
+            return f"\n{ts}  {line}\n"
+
+        # Primary workflow stages (WF1/WF2/Checks)
+        for tag in ("[WF1]", "[WF2]", "[CHECK]", "[FINAL]", "[SEED]", "[CANCEL]", "[WARN]", "[CLEANUP]"):
+            if line.startswith(tag):
+                return f"{ts}  {line}"
+
+        # Default: indent slightly to group under previous header
+        return f"{ts}    {line}"
+
+
+    class _ConsoleList(list):
+        """List that mirrors additions to the terminal with nice formatting."""
+
+        def _print(self, txt: str):
+            try:
+                print(_fmt_console(txt), flush=True)
+            except Exception:
+                pass  # don't break on logging errors
+
+        def append(self, item):  # type: ignore[override]
+            super().append(item)
+            self._print(item)
+
+        def extend(self, items):  # type: ignore[override]
+            super().extend(items)
+            for _i in items:
+                self._print(_i)
+
+    log_lines: List[str] = _ConsoleList()
 
     # ----------------------------------------------------------------------
     # If the user enabled direct prompt loading, create a temporary prompts
@@ -371,9 +503,20 @@ def run_pipeline_gui(
             if override_loras_307_flag:
                 _patch_node("307", lora307_paths, lora307_strengths)
 
+            # --- Force Workflow 2 to save images in the root output dir ----
+            # Node 249 contains the path used by SaveImage_EQX (node 227) as
+            #     "output_path".  Its default value "POR_DEFINIR" provoca la
+            # creación de carpetas intermedias.  Lo reemplazamos por "" para
+            # que guarde directamente en la ruta *output_dir* sin sub-carpetas.
+            try:
+                if "249" in data_wf2:
+                    data_wf2["249"].setdefault("inputs", {})["text"] = ""
+            except Exception:
+                pass
+
             Path(wf2_path_mod).write_text(json.dumps(data_wf2, indent=2))
         except Exception as e:
-            log_lines.append(f"[WARN] Could not apply LoRA overrides: {e}")
+            log_lines.extend([f"[WARN] Could not apply LoRA overrides: {e}"])
 
     # When using direct prompt loading, patch node 190's file_path to our temp file
     if load_prompts_directly and tmp_prompt_file:
@@ -398,7 +541,7 @@ def run_pipeline_gui(
                 data_local["171"].setdefault("inputs", {})["text"] = characteristics_text.strip()
                 Path(wf1_path_mod).write_text(json.dumps(data_local, indent=2))
         except Exception as e:
-            log_lines.append(f"[WARN] Could not set characteristics text for node 171: {e}")
+            log_lines.extend([f"[WARN] Could not set characteristics text for node 171: {e}"])
 
     # ----------------------------------------------------------------------
     # DEBUG: Save final workflow JSONs sent to ComfyUI ----------------------
@@ -410,7 +553,7 @@ def run_pipeline_gui(
         shutil.copy(wf1_path_mod, debug_dir / f"WF1_{ts}.json")
         shutil.copy(wf2_path_mod, debug_dir / f"WF2_{ts}.json")
     except Exception as e:
-        log_lines.append(f"[WARN] Could not save debug workflow JSONs: {e}")
+        log_lines.extend([f"[WARN] Could not save debug workflow JSONs: {e}"])
 
     success_count = 0
     attempt = 0
@@ -447,6 +590,11 @@ def run_pipeline_gui(
     # Album of generated images that pass checks
     album_images: List[Image.Image] = []
 
+    # Collects human-readable seed information shown in the GUI
+    seeds_log_lines: List[str] = ["=== Seeds Log (per attempt) ==="]
+    def _seeds_log_str():
+        return "\n".join(seeds_log_lines)
+
     while True:
         # Stop when the requested amount is reached (unless endless mode)
         if not endless_until_cancel and success_count >= target_successes:
@@ -454,21 +602,21 @@ def run_pipeline_gui(
 
         # Check if user requested cancellation from the UI
         if CANCEL_REQUESTED:
-            log_lines.append("[CANCEL] Execution cancelled by user.")
+            log_lines.extend([f"[CANCEL] Execution cancelled by user."])
             status_str = "Cancelled"
             current_log = "\n\n".join(log_lines)
             pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-            yield None, current_log, None, album_images, *_boxes(pending)
+            yield None, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
             break
 
         attempt += 1
         # Separador visual entre intentos
         if attempt > 1:
-            log_lines.append("")  # línea en blanco
+            log_lines.extend([""])  # línea en blanco
         total_target = "∞" if endless_until_cancel else target_successes
-        log_lines.append(
+        log_lines.extend([
             f"========== ATTEMPT {attempt} | Passed {success_count}/{total_target} =========="
-        )
+        ])
 
         # ------------------------------------------------------------------
         # Prepare seed according to the selected mode
@@ -485,6 +633,20 @@ def run_pipeline_gui(
                 pass
             return False
 
+        # Helper: set any *inputs[key]* of a given node id -------------------
+        def _set_input_by_id(path_json: str, node_id: str, key: str, value):
+            """Patch *key* in *node_id* inside workflow JSON located at *path_json*."""
+            try:
+                data_local = json.loads(Path(path_json).read_text())
+                node = data_local.get(node_id)
+                if isinstance(node, dict):
+                    node.setdefault("inputs", {})[key] = value
+                    Path(path_json).write_text(json.dumps(data_local, indent=2))
+                    return True
+            except Exception:
+                pass
+            return False
+
         current_seed_val: int | None = None
         if seed_mode.lower().startswith("incre"):
             # Initialise counter only the first time we use it.
@@ -497,51 +659,93 @@ def run_pipeline_gui(
         else:  # Fallback to the value typed by the user (static)
             current_seed_val = min(int(seed_counter_input), MAX_SEED_VALUE)
 
-        if _set_seed(wf1_path_mod, current_seed_val):
-            log_lines.append(f"[SEED] Using seed {current_seed_val} (mode: {seed_mode}) for prompt loader")
-        else:
-            log_lines.append("[SEED] Warning: could not locate prompt seed node (Load Prompt From File - EQX) to update")
+        # WF1 – Prompt seed --------------------------------------------------------
+        if not _set_seed(wf1_path_mod, current_seed_val):
+            log_lines.append("[WARN] Could not set prompt loader seed (node 190)")
 
-        # NEW: randomise the seed used by the KSampler via the 'Seed Everywhere' node (id 189)
+        # WF1 – Image seed via Seed Everywhere -------------------------------------
         image_seed_val = random.randint(0, MAX_SEED_VALUE)
-        if _set_seed(wf1_path_mod, image_seed_val, node_class="Seed Everywhere"):
-            log_lines.append(f"[SEED] Using random image seed {image_seed_val} for KSampler (Seed Everywhere)")
-        else:
-            log_lines.append("[SEED] Warning: could not locate 'Seed Everywhere' node to update")
+        if not _set_seed(wf1_path_mod, image_seed_val, node_class="Seed Everywhere"):
+            log_lines.append("[WARN] Could not set Seed Everywhere (node 189)")
+
+        # WF2 – RandomNoise seeds --------------------------------------------------
+        noise_seed_231 = random.randint(0, MAX_SEED_VALUE)
+        noise_seed_294 = random.randint(0, MAX_SEED_VALUE)
+        _set_input_by_id(wf2_path_mod, "231", "noise_seed", noise_seed_231)
+        _set_input_by_id(wf2_path_mod, "294", "noise_seed", noise_seed_294)
+
+        # ------------------------------------------------------------------
+        # Collect seeds for logging ----------------------------------------
+        # ------------------------------------------------------------------
+        # Visual separation between attempts
+        if attempt > 1:
+            seeds_log_lines.append("")
+
+        # Build structured seed log block ---------------------------------
+        seed_block_gui = [
+            f"Attempt {attempt}:",
+            " WF1:",
+            f"  Prompt loader seed (190): {current_seed_val}",
+            f"  Seed Everywhere (189): {image_seed_val}",
+            " WF2:",
+            f"  noise_seed (231): {noise_seed_231}",
+            f"  noise_seed (294): {noise_seed_294}",
+        ]
+
+        seeds_log_lines.extend(seed_block_gui)
+
+        # Mirror same structure to main log for terminal output ------------
+        seed_block_cli = [
+            "[SEED] WF1:",
+            f"[SEED]   Prompt loader seed (190): {current_seed_val}",
+            f"[SEED]   Seed Everywhere (189): {image_seed_val}",
+            "[SEED] WF2:",
+            f"[SEED]   noise_seed (231): {noise_seed_231}",
+            f"[SEED]   noise_seed (294): {noise_seed_294}",
+        ]
+
+        log_lines.extend(seed_block_cli)
 
         # ------------------------------------------------------------------
         # Run Workflow 1
         # ------------------------------------------------------------------
-        log_lines.append("[WF1] Running Workflow1…")
+        log_lines.extend([f"[WF1] Running Workflow1…"])
         status_str = "Generating (WF1)"
+
+        # --- Yield *before* starting the lengthy WF1 call so the GUI shows
+        #     the attempt header and seeds immediately ---------------------
+        current_log = "\n\n".join(log_lines)
+        pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
+        yield None, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
+
         start_time = time.time()
         try:
             oc.run_workflow(wf1_path_mod)
         except Exception as e:
             err_msg = f"Error while executing Workflow1: {e}"
-            log_lines.append(err_msg)
+            log_lines.extend([err_msg])
             current_log = "\n\n".join(log_lines)
             pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-            yield None, current_log, None, album_images, *_boxes(pending)
+            yield None, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
             continue
 
         wf1_img_path = oc.newest_file(output_dir, after=start_time)
         if wf1_img_path is None:
             err_msg = "Could not find the resulting image from Workflow1."
-            log_lines.append(err_msg)
+            log_lines.extend([err_msg])
             current_log = "\n\n".join(log_lines)
             pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-            yield None, current_log, None, album_images, *_boxes(pending)
+            yield None, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
             continue
 
         wf1_img_pil = _load_img(wf1_img_path)
 
-        log_lines.append(f"[WF1] Image generated: {wf1_img_path}")
+        log_lines.extend([f"[WF1] Image generated: {wf1_img_path}"])
 
         # Show WF1 image immediately
         current_log = "\n\n".join(log_lines)
         pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-        yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
+        yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
 
         # ----------------------------------------------------------------------
         # Build optional parameters for run_checks according to UI
@@ -551,12 +755,12 @@ def run_pipeline_gui(
             cat_keys = [k for k in sorted(CATEGORY_DISPLAY_MAPPINGS.keys()) if k != "NOT_DETECTED"]
             allowed_categories = {cat_keys[i] for i, checked in enumerate(nsfw_categories) if checked}
 
-        log_lines.append("[CHECK] Running external checks…")
+        log_lines.extend([f"[CHECK] Running external checks…"])
         status_str = "Checks"
         # Yield before running checks so UI reflects status change
         current_log = "\n\n".join(log_lines)
         pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-        yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
+        yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
         try:
             results = oc.run_checks(
                 wf1_img_path,
@@ -567,45 +771,48 @@ def run_pipeline_gui(
             )
         except Exception as e:
             err_msg = f"Error while executing checks: {e}"
-            log_lines.append(err_msg)
+            log_lines.extend([err_msg])
             current_log = "\n\n".join(log_lines)
             pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-            yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
+            yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
             continue
 
-        log_lines.append(f"[CHECK] Results: {json.dumps(results, indent=2, ensure_ascii=False)}")
+        # Pretty-print results on multiple lines for readability ------------
+        log_lines.append("[CHECK] Results:")
+        for _ln in json.dumps(results, indent=2, ensure_ascii=False).splitlines():
+            log_lines.append(f"  {_ln}")
 
         current_log = "\n\n".join(log_lines)
         pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-        yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
+        yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
 
         # -----------------------------
         failed = False
         if results.get("is_nsfw"):
             failed = True
-            log_lines.append("[CHECK] Image flagged as NSFW. Pipeline stops.")
+            log_lines.extend([f"[CHECK] Image flagged as NSFW. Pipeline stops."])
 
         if stop_multi_faces and results.get("face_count", 0) > 1:
             failed = True
-            log_lines.append("[CHECK] More than one face detected and stop option is active.")
+            log_lines.extend([f"[CHECK] More than one face detected and stop option is active."])
 
         if stop_partial_face and results.get("is_partial_face"):
             failed = True
-            log_lines.append("[CHECK] Partial face detected and stop option is active.")
+            log_lines.extend([f"[CHECK] Partial face detected and stop option is active."])
 
         if failed:
             # Delete the generated file to save disk space
             try:
                 Path(wf1_img_path).unlink(missing_ok=True)
             except Exception as e:
-                log_lines.append(f"[CLEANUP] Could not delete failed image: {e}")
+                log_lines.extend([f"[CLEANUP] Could not delete failed image: {e}"])
 
             # La ejecución se considera fallida; no incrementamos success_count
             global GLOBAL_REJECTED_COUNT
             GLOBAL_REJECTED_COUNT += 1
             current_log = "\n\n".join(log_lines)
             pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-            yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
+            yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
             continue
 
         # ----------------------------------------------------------------------
@@ -617,34 +824,40 @@ def run_pipeline_gui(
         except Exception:
             shutil.copy(wf1_img_path, verified_path)
 
-        log_lines.append("[WF2] Running Workflow2…")
+        # NEW: remove the original Workflow-1 image so we only keep the temporary verified copy
+        try:
+            Path(wf1_img_path).unlink(missing_ok=True)
+        except Exception as e:
+            log_lines.extend([f"[CLEANUP] Could not delete intermediate WF1 image: {e}"])
+
+        log_lines.extend([f"[WF2] Running Workflow2…"])
         status_str = "Generating (WF2)"
         current_log = "\n\n".join(log_lines)
         pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-        yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
+        yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
         start_time2 = time.time()
         overrides = {oc.LOAD_NODE_ID_WF2: {"image": str(verified_path)}}
         try:
             oc.run_workflow(wf2_path_mod, overrides=overrides)
         except Exception as e:
             err_msg = f"Error while executing Workflow2: {e}"
-            log_lines.append(err_msg)
+            log_lines.extend([err_msg])
             current_log = "\n\n".join(log_lines)
             pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-            yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
+            yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
             continue
 
         wf2_img_path = oc.newest_file(output_dir, after=start_time2)
         if wf2_img_path is None:
             err_msg = "Could not find the resulting image from Workflow2."
-            log_lines.append(err_msg)
+            log_lines.extend([err_msg])
             current_log = "\n\n".join(log_lines)
             pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-            yield wf1_img_pil, current_log, None, album_images, *_boxes(pending)
+            yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
             continue
 
         wf2_img_pil = _load_img(wf2_img_path)
-        log_lines.append(f"[WF2] Image generated: {wf2_img_path}")
+        log_lines.extend([f"[WF2] Image generated: {wf2_img_path}"])
 
         # Add the approved final image to the album and display
         album_images.append(wf2_img_pil)
@@ -657,7 +870,7 @@ def run_pipeline_gui(
 
         current_log = "\n\n".join(log_lines)
         pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-        yield wf1_img_pil, current_log, wf2_img_pil, album_images, *_boxes(pending)
+        yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
 
         # Extract base filename from node 175 (ShowText) for this attempt
         def _extract_filename_base(wf1_json: str, wf2_json: str) -> str | None:
@@ -790,8 +1003,15 @@ def run_pipeline_gui(
             else:
                 final_path = final_dir / wf2_img_path.name
             shutil.copy(wf2_img_path, final_path)
+            log_lines.extend([f"[FINAL] Image saved as: {final_path}"])
+            # NEW: remove the original Workflow-2 image written by ComfyUI to avoid duplicates
+            try:
+                Path(wf2_img_path).unlink(missing_ok=True)
+            except Exception as e_cleanup:
+                log_lines.extend([f"[CLEANUP] Could not delete intermediate WF2 image: {e_cleanup}"])
+
         except Exception as e:
-            log_lines.append(f"Warning: could not copy final image to {final_path}: {e}")
+            log_lines.extend([f"Warning: could not copy final image to {final_path}: {e}"])
 
         # Si llegamos aquí la imagen pasó todos los filtros ⇒ contamos como éxito
         success_count += 1
@@ -806,7 +1026,7 @@ def run_pipeline_gui(
 
     final_pending = 0
     final_log = "\n\n".join(log_lines)
-    yield None, final_log, None, album_images, *_boxes(final_pending)
+    yield None, final_log, _seeds_log_str(), None, album_images, *_boxes(final_pending)
 
     # (global mappings are updated during GUI construction; do not reassign
     # them here to avoid Python's local-variable shadowing.)
@@ -820,32 +1040,11 @@ def run_pipeline_gui(
 
 def launch_gui():
     with gr.Blocks(css=CSS) as demo:
-        gr.Markdown(
-            """
-            # ComfyUI Pipeline Manager + External Checks
-            1. Runs Workflow 1 and shows the generated image.  
-            2. Applies the selected external checks.  
-            3. If all checks pass, runs Workflow 2 and shows the final image.
-            """
-        )
+        gr.Markdown("# WorkflowUI")
 
         # -------------------- Preset section at top ----------------------
         with gr.Accordion("Configuration Presets", open=False):
-            gr.Markdown(
-                """
-                **Preset Manager** – Save and organise full GUI configurations so they can later be reused from the
-                CLI.  Typical workflow:
-
-                1. Configure all options in the GUI.
-                2. Type a **Preset name** and click **Save/Overwrite**.
-                3. Use **Load** to restore a preset or **Delete / Rename** to manage the list.
-                4. **Export** downloads the selected preset as a JSON file (for backup or sharing).
-                5. **Import** lets you add an external JSON preset to the list.
-
-                Use the **Filter** box if you accumulate hundreds of presets – it performs a case-insensitive
-                substring match on preset names.
-                """
-            )
+            gr.Markdown("")
 
             # -------- Two-column layout ---------------------------------
             with gr.Row():
@@ -1132,6 +1331,7 @@ def launch_gui():
 
                 # Log textbox (below all accordions)
                 log_text = gr.Textbox(label="Log", lines=18, interactive=False)
+                seeds_log_text = gr.Textbox(label="Seeds Log", lines=8, interactive=False)
 
             with gr.Column(scale=3):
                 # First row: both workflow images side by side
@@ -1257,6 +1457,17 @@ def launch_gui():
                     override_components.append(comp_182)
                     WF1_OVERRIDE_MAPPING.append(("182", "steps", int))
 
+                    # 190 – File Path (Load Prompt From File)
+                    n190 = wf1_data.get("190", {})
+                    comp_190 = gr.Textbox(
+                        label="File Path - 190 (relative to texts/)",
+                        value=_def_val(n190, "file_path", ""),
+                        placeholder="my_prompts.txt",
+                        info="Only Filename"
+                    )
+                    override_components.append(comp_190)
+                    WF1_OVERRIDE_MAPPING.append(("190", "file_path", str))
+
                 # ---------------- RIGHT: Workflow 2 ----------------
                 with gr.Column(scale=1):
                     gr.Markdown("### Workflow 2 Overrides")
@@ -1350,12 +1561,6 @@ def launch_gui():
                     override_components2.append(comp_306)
                     WF2_OVERRIDE_MAPPING.append(("306", "prompt", str))
 
-                    # 311 – Text 311
-                    n311 = wf2_data.get("311", {})
-                    comp_311 = gr.Textbox(label="Text – 311", value=_def_val(n311, "text", ""))
-                    override_components2.append(comp_311)
-                    WF2_OVERRIDE_MAPPING.append(("311", "text", str))
-
             # Update globals and mappings -------------------------------
             WF1_MAPPING = WF1_OVERRIDE_MAPPING
             WF2_MAPPING = WF2_OVERRIDE_MAPPING
@@ -1369,6 +1574,13 @@ def launch_gui():
 
         # ---------------- LoRA OVERRIDES ----------------
         with gr.Accordion("LoRA Overrides (nodes 244 & 307)", open=False):
+            # Info note for users about default behaviour when fields are left blank
+            gr.Markdown("**Note:** If these fields are left blank, the default LoRAs defined in the workflow will be used.")
+            # Option to auto-fill LoRAs -------------------------------------------------
+            with gr.Accordion("Auto-fill LoRAs from directory", open=False):
+                auto_lora_cb = gr.Checkbox(label="Enable auto-fill", value=False)
+                lora_dir_tb = gr.Textbox(label="LoRA directory (absolute path)", placeholder="/abs/path/to/your/lora_dir")
+                populate_btn = gr.Button("Auto Select LORAs")
             with gr.Row():
                 # Node 244 --------------------------------------------------
                 with gr.Column(scale=1):
@@ -1395,6 +1607,67 @@ def launch_gui():
                             sl = gr.Slider(0.0, 1.5, default_strength, step=0.05, label="strength")
                         lora307_inputs.append(txt)
                         lora307_strengths.append(sl)
+
+            # Callback to populate LoRA paths ------------------------------------
+            def _populate_lora_slots(dir_path: str, *_):
+                """Return updates for the 12 LoRA path textboxes using files from *dir_path*."""
+                from pathlib import Path as _P
+                import random as _rnd
+                if not dir_path:
+                    return [gr.update() for _ in range(12)]
+
+                try:
+                    base = _P(dir_path).expanduser().resolve()
+                    if not base.is_dir():
+                        raise FileNotFoundError
+
+                    files = sorted(base.rglob("*.safetensors"))
+                    if not files:
+                        raise FileNotFoundError
+
+                    flux = None
+                    for p in files:
+                        if p.name.lower() == "flux_realism_lora.safetensors":
+                            flux = p
+                            break
+
+                    def _rel(p: _P):
+                        try:
+                            return str(p.relative_to(base))
+                        except ValueError:
+                            return p.name
+
+                    # Prepare selection pool without flux
+                    pool = [p for p in files if (flux is None or p.resolve() != flux.resolve()) and "flux_realism_lora" not in p.name.lower()]
+                    _rnd.shuffle(pool)
+                    sel = pool[:10]
+
+                    # Build list of 12 values (6 for 244, 6 for 307)
+                    values = [""] * 12
+                    if flux:
+                        values[0] = _rel(flux)
+                        values[6] = _rel(flux)
+
+                    # Fill positions 1-5 and 7-11
+                    for i in range(5):
+                        if i < len(sel):
+                            values[i+1] = _rel(sel[i])
+                    for i in range(5):
+                        idx = i + 5
+                        if idx < len(sel):
+                            values[i+7] = _rel(sel[idx])
+
+                    return [gr.update(value=v) for v in values]
+                except Exception:
+                    # On error, leave unchanged
+                    return [gr.update() for _ in range(12)]
+
+            # Wire button ---------------------------------------------------------
+            populate_btn.click(
+                _populate_lora_slots,
+                inputs=[lora_dir_tb],
+                outputs=[*lora244_inputs, *lora307_inputs],
+            )
 
         # -------------------------------------------------------------------
         # Dynamic workflow editors ------------------------------------------------
@@ -1423,6 +1696,8 @@ def launch_gui():
             *nsfw_cat_checkboxes,
             *override_components,
             *override_components2,
+            auto_lora_cb,
+            lora_dir_tb,
             *lora244_inputs,
             *lora244_strengths,
             *lora307_inputs,
@@ -1513,6 +1788,8 @@ def launch_gui():
                 *nsfw_cat_checkboxes,
                 *override_components,
                 *override_components2,
+                auto_lora_cb,
+                lora_dir_tb,
                 *lora244_inputs,
                 *lora244_strengths,
                 *lora307_inputs,
@@ -1521,6 +1798,7 @@ def launch_gui():
             outputs=[
                 wf1_img_out,
                 log_text,
+                seeds_log_text,
                 wf2_img_out,
                 album_gallery,
                 pending_box,
