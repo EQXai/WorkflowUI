@@ -60,6 +60,7 @@ WORKFLOW_DIR = Path(os.getenv("WORKFLOW_DIR", str(Path(__file__).parent / "workf
 
 # Paths to the two workflows used by the pipeline (relative to project root)
 WORKFLOW1_JSON = str(WORKFLOW_DIR / "Workflow1.json")
+WORKFLOW1_PROMPTCONCAT_JSON = str(WORKFLOW_DIR / "Workflow1_PromptConcat.json")  # New variant with PromptConcat
 WORKFLOW2_JSON = str(WORKFLOW_DIR / "Workflow2.json")
 
 # Node ID from Workflow2 that loads an image from a path. Adjust if you change

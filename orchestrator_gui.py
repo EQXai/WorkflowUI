@@ -34,6 +34,12 @@ MAX_SEED_VALUE = 18446744073709551615  # Upper limit for any seed value (uint64 
 # NEW: Maximum number of images kept in the on-screen gallery
 MAX_GALLERY_IMAGES = 20  # Only the last 20 approved images will be shown
 
+# ComfyUI internally clamps seeds to 32-bit.  Using larger numbers results in a
+# different value being applied than the one shown in the log.  We therefore
+# define an explicit cap that matches ComfyUI's behaviour and make sure every
+# seed we generate respects it.
+COMFY_MAX_SEED = 0xFFFFFFFF  # 4_294_967_295
+
 # -------------------------------------------------------------
 # Dynamic form helpers for workflow editing
 # -------------------------------------------------------------
@@ -242,6 +248,7 @@ def _load_img(path: Path) -> Image.Image | None:
 
 
 def run_pipeline_gui(
+    wf1_mode: str,
     do_nsfw: bool,
     do_face_count: bool,
     do_partial_face: bool,
@@ -288,6 +295,9 @@ def run_pipeline_gui(
     # Status helper ---------------------------------------------------------
     global CANCEL_REQUESTED, GLOBAL_SEED_COUNTER
     CANCEL_REQUESTED = False  # reset at start of each invocation
+
+    # Detect selected WF1 variant ------------------------------------------
+    is_promptconcat = wf1_mode.lower().startswith("prompt")
 
     # Split dynamic_values into nsfw category toggles and workflow edits
     num_nsfw_cats = len([k for k in CATEGORY_DISPLAY_MAPPINGS.keys() if k != "NOT_DETECTED"])
@@ -430,6 +440,14 @@ def run_pipeline_gui(
 
         def _print(self, txt: str):
             try:
+                if not hasattr(self, "_first_print_done"):
+                    self._first_print_done = True
+                else:
+                    # Add blank line before most entries for visual separation,
+                    # except when printing consecutive lines of a JSON block
+                    stripped = txt.lstrip()
+                    if not (stripped.startswith("{") or stripped.startswith("}") or stripped.startswith("\"") ):
+                        print("", flush=False)
                 print(_fmt_console(txt), flush=True)
             except Exception:
                 pass  # don't break on logging errors
@@ -472,7 +490,8 @@ def run_pipeline_gui(
     # incremented later as before.
     # ----------------------------------------------------------------------
 
-    wf1_path_mod = _apply_edits_to_workflow(oc.WORKFLOW1_JSON, WF1_MAPPING, wf1_edit_vals)
+    wf1_original_path = oc.WORKFLOW1_PROMPTCONCAT_JSON if is_promptconcat else oc.WORKFLOW1_JSON
+    wf1_path_mod = _apply_edits_to_workflow(wf1_original_path, WF1_MAPPING, wf1_edit_vals)
     wf2_path_mod = _apply_edits_to_workflow(oc.WORKFLOW2_JSON, WF2_MAPPING, wf2_edit_vals)
 
     # --------------------------------------------------
@@ -519,7 +538,7 @@ def run_pipeline_gui(
             log_lines.extend([f"[WARN] Could not apply LoRA overrides: {e}"])
 
     # When using direct prompt loading, patch node 190's file_path to our temp file
-    if load_prompts_directly and tmp_prompt_file:
+    if load_prompts_directly and tmp_prompt_file and not is_promptconcat:
         def _set_prompt_file(path_json: str, file_path: str, node_class: str = "Load Prompt From File - EQX") -> bool:
             try:
                 data_local = json.loads(Path(path_json).read_text())
@@ -544,16 +563,10 @@ def run_pipeline_gui(
             log_lines.extend([f"[WARN] Could not set characteristics text for node 171: {e}"])
 
     # ----------------------------------------------------------------------
-    # DEBUG: Save final workflow JSONs sent to ComfyUI ----------------------
+    # (The debug copy is now saved **inside** the attempt loop, once all
+    #  seed values have been patched.  This guarantees that the JSON files
+    #  written to WF_debug reflect exactly the parameters sent to ComfyUI.)
     # ----------------------------------------------------------------------
-    try:
-        debug_dir = Path(__file__).resolve().parent / "WF_debug"
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        shutil.copy(wf1_path_mod, debug_dir / f"WF1_{ts}.json")
-        shutil.copy(wf2_path_mod, debug_dir / f"WF2_{ts}.json")
-    except Exception as e:
-        log_lines.extend([f"[WARN] Could not save debug workflow JSONs: {e}"])
 
     success_count = 0
     attempt = 0
@@ -651,26 +664,35 @@ def run_pipeline_gui(
         if seed_mode.lower().startswith("incre"):
             # Initialise counter only the first time we use it.
             if GLOBAL_SEED_COUNTER is None:
-                GLOBAL_SEED_COUNTER = int(seed_counter_input) % (MAX_SEED_VALUE + 1)
+                GLOBAL_SEED_COUNTER = int(seed_counter_input) % (COMFY_MAX_SEED + 1)
             current_seed_val = GLOBAL_SEED_COUNTER
-            GLOBAL_SEED_COUNTER = (GLOBAL_SEED_COUNTER + 1) % (MAX_SEED_VALUE + 1)
+            GLOBAL_SEED_COUNTER = (GLOBAL_SEED_COUNTER + 1) % (COMFY_MAX_SEED + 1)
         elif seed_mode.lower().startswith("rand"):
-            current_seed_val = random.randint(0, MAX_SEED_VALUE)
+            current_seed_val = random.randint(0, COMFY_MAX_SEED)
         else:  # Fallback to the value typed by the user (static)
-            current_seed_val = min(int(seed_counter_input), MAX_SEED_VALUE)
+            current_seed_val = min(int(seed_counter_input), COMFY_MAX_SEED)
 
         # WF1 – Prompt seed --------------------------------------------------------
-        if not _set_seed(wf1_path_mod, current_seed_val):
-            log_lines.append("[WARN] Could not set prompt loader seed (node 190)")
+        if is_promptconcat:
+            if not _set_input_by_id(wf1_path_mod, "291", "seed", current_seed_val):
+                log_lines.append("[WARN] Could not set PromptConcatUnified seed (node 291)")
+        else:
+            if not _set_seed(wf1_path_mod, current_seed_val):
+                log_lines.append("[WARN] Could not set prompt loader seed (node 190)")
 
-        # WF1 – Image seed via Seed Everywhere -------------------------------------
-        image_seed_val = random.randint(0, MAX_SEED_VALUE)
-        if not _set_seed(wf1_path_mod, image_seed_val, node_class="Seed Everywhere"):
-            log_lines.append("[WARN] Could not set Seed Everywhere (node 189)")
+        # WF1 – Image seed via Seed_KSampler_1 (node 189) ---------------------------
+        image_seed_val = random.randint(0, COMFY_MAX_SEED)
+        if not _set_input_by_id(wf1_path_mod, "189", "seed", image_seed_val):
+            log_lines.append("[WARN] Could not set Seed_KSampler_1 seed (node 189)")
+
+        # WF1 – Image seed via Seed_KSampler_2 (node 285) ---------------------------
+        ksampler2_seed_val = random.randint(0, COMFY_MAX_SEED)
+        if not _set_input_by_id(wf1_path_mod, "285", "seed", ksampler2_seed_val):
+            log_lines.append("[WARN] Could not set Seed_KSampler_2 seed (node 285)")
 
         # WF2 – RandomNoise seeds --------------------------------------------------
-        noise_seed_231 = random.randint(0, MAX_SEED_VALUE)
-        noise_seed_294 = random.randint(0, MAX_SEED_VALUE)
+        noise_seed_231 = random.randint(0, COMFY_MAX_SEED)
+        noise_seed_294 = random.randint(0, COMFY_MAX_SEED)
         _set_input_by_id(wf2_path_mod, "231", "noise_seed", noise_seed_231)
         _set_input_by_id(wf2_path_mod, "294", "noise_seed", noise_seed_294)
 
@@ -682,29 +704,145 @@ def run_pipeline_gui(
             seeds_log_lines.append("")
 
         # Build structured seed log block ---------------------------------
-        seed_block_gui = [
-            f"Attempt {attempt}:",
-            " WF1:",
-            f"  Prompt loader seed (190): {current_seed_val}",
-            f"  Seed Everywhere (189): {image_seed_val}",
-            " WF2:",
-            f"  noise_seed (231): {noise_seed_231}",
-            f"  noise_seed (294): {noise_seed_294}",
-        ]
+        if is_promptconcat:
+            seed_block_gui = [
+                f"Attempt {attempt}:",
+                " WF1:",
+                f"  PromptConcat seed (291): {current_seed_val}",
+                f"  Seed_KSampler_1 (189): {image_seed_val}",
+                f"  Seed_KSampler_2 (285): {ksampler2_seed_val}",
+                " WF2:",
+                f"  noise_seed (231): {noise_seed_231}",
+                f"  noise_seed (294): {noise_seed_294}",
+            ]
+            seed_block_cli = [
+                "[SEED] WF1:",
+                f"[SEED]   PromptConcat seed (291): {current_seed_val}",
+                f"[SEED]   Seed_KSampler_1 (189): {image_seed_val}",
+                f"[SEED]   Seed_KSampler_2 (285): {ksampler2_seed_val}",
+                "[SEED] WF2:",
+                f"[SEED]   noise_seed (231): {noise_seed_231}",
+                f"[SEED]   noise_seed (294): {noise_seed_294}",
+            ]
+        else:
+            seed_block_gui = [
+                f"Attempt {attempt}:",
+                " WF1:",
+                f"  Prompt loader seed (190): {current_seed_val}",
+                f"  Seed_KSampler_1 (189): {image_seed_val}",
+                f"  Seed_KSampler_2 (285): {ksampler2_seed_val}",
+                " WF2:",
+                f"  noise_seed (231): {noise_seed_231}",
+                f"  noise_seed (294): {noise_seed_294}",
+            ]
+            seed_block_cli = [
+                "[SEED] WF1:",
+                f"[SEED]   Prompt loader seed (190): {current_seed_val}",
+                f"[SEED]   Seed_KSampler_1 (189): {image_seed_val}",
+                f"[SEED]   Seed_KSampler_2 (285): {ksampler2_seed_val}",
+                "[SEED] WF2:",
+                f"[SEED]   noise_seed (231): {noise_seed_231}",
+                f"[SEED]   noise_seed (294): {noise_seed_294}",
+            ]
 
+        # Add seeds to dedicated log pane
         seeds_log_lines.extend(seed_block_gui)
 
-        # Mirror same structure to main log for terminal output ------------
-        seed_block_cli = [
-            "[SEED] WF1:",
-            f"[SEED]   Prompt loader seed (190): {current_seed_val}",
-            f"[SEED]   Seed Everywhere (189): {image_seed_val}",
-            "[SEED] WF2:",
-            f"[SEED]   noise_seed (231): {noise_seed_231}",
-            f"[SEED]   noise_seed (294): {noise_seed_294}",
-        ]
+        # Do not add seed details to main log to avoid duplication
+        # log_lines.extend(seed_block_gui)
 
-        log_lines.extend(seed_block_cli)
+        # --------------------------------------------------------------
+        # Extract and log positive/negative prompts (WF1) -------------
+        # --------------------------------------------------------------
+        def _extract_prompts_normal(path_json: str, seed_val: int):
+            try:
+                data_local = json.loads(Path(path_json).read_text())
+                node190 = data_local.get("190", {})
+                fpath = node190.get("inputs", {}).get("file_path")
+                if not isinstance(fpath, str) or not Path(fpath).exists():
+                    return None, None
+                lines = Path(fpath).read_text(encoding="utf-8", errors="ignore").splitlines()
+                if not lines:
+                    return None, None
+                idx = seed_val % len(lines)
+                raw = lines[idx].strip()
+                import re as _re
+                m = _re.match(r"\{\{\{[^}]+\}\}\}\{([^}]*)\}\{([^}]*)\}", raw)
+                if not m:
+                    m = _re.match(r"\{\{\{[^}]+\}\}\}\{\{([^}]*)\}\}\{([^}]*)\},?", raw)
+                if m:
+                    return m.group(1).strip(), m.group(2).strip()
+            except Exception:
+                pass
+            return None, None
+
+        pos_prompt: str | None = None
+        neg_prompt: str | None = None
+
+        if not is_promptconcat:
+            pos_prompt, neg_prompt = _extract_prompts_normal(wf1_path_mod, current_seed_val)
+        else:
+            # Build prompts by emulating node 293 behaviour
+            try:
+                data_pc = json.loads(Path(wf1_path_mod).read_text())
+                node293 = data_pc.get("293", {})
+                inp = node293.get("inputs", {}) if isinstance(node293, dict) else {}
+                base_dir = Path(inp.get("base_dir", ""))
+                pos_join = inp.get("positive_joiner", " ")
+                neg_join = inp.get("negative_joiner", ", ")
+
+                seed_local = int(inp.get("seed", current_seed_val)) if isinstance(inp.get("seed"), int) else current_seed_val
+
+                def _concat_parts(subdir: str, joiner: str):
+                    """Return concatenated string for *subdir* replicating node 293 logic.
+
+                    The real ComfyUI node selects **one** random line from every
+                    text file inside *base_dir/subdir*.  The random generator is
+                    initialised with the same seed that is fed to the node so
+                    the selection is deterministic for a given seed value.
+
+                    This implementation mirrors that behaviour using
+                    ``random.Random(seed_local)`` so the previews shown in the
+                    GUI match the actual prompts that ComfyUI will build.
+                    """
+
+                    try:
+                        dir_p = base_dir / subdir
+                        parts_files = sorted(dir_p.glob("*.txt"))
+
+                        if not parts_files:
+                            return None
+
+                        import hashlib
+
+                        tokens: list[str] = []
+
+                        for f in parts_files:
+                            lines = [ln.strip() for ln in f.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
+                            if not lines:
+                                continue  # skip empty files
+
+                            # Derive per-file sub-seed exactly like the ComfyUI node
+                            digest = hashlib.sha256((f.name + str(seed_local)).encode()).digest()
+                            sub_seed = int.from_bytes(digest[:8], "big")
+                            rng = random.Random(sub_seed)
+
+                            idx = rng.randrange(len(lines))
+                            tokens.append(lines[idx])
+
+                        return joiner.join(tokens) if tokens else None
+                    except Exception:
+                        # Any error -> return None so caller can handle gracefully
+                        return None
+
+                pos_prompt = _concat_parts("positive", pos_join)
+                neg_prompt = _concat_parts("negative", neg_join)
+            except Exception:
+                pos_prompt = neg_prompt = None
+
+        if pos_prompt is not None or neg_prompt is not None:
+            log_lines.append(f"[PROMPT] Positive: {pos_prompt if pos_prompt is not None else '-'}")
+            log_lines.append(f"[PROMPT] Negative: {neg_prompt if neg_prompt is not None else '-'}")
 
         # ------------------------------------------------------------------
         # Run Workflow 1
@@ -1017,6 +1155,18 @@ def run_pipeline_gui(
         success_count += 1
         global GLOBAL_APPROVED_COUNT
         GLOBAL_APPROVED_COUNT += 1
+
+        # ------------------------------------------------------------------
+        # DEBUG: Save workflow JSONs with final seeds for this attempt ------
+        # ------------------------------------------------------------------
+        try:
+            debug_dir = Path(__file__).resolve().parent / "WF_debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            ts_attempt = time.strftime("%Y%m%d_%H%M%S")
+            shutil.copy(wf1_path_mod, debug_dir / f"WF1_{ts_attempt}_attempt{attempt}.json")
+            shutil.copy(wf2_path_mod, debug_dir / f"WF2_{ts_attempt}_attempt{attempt}.json")
+        except Exception as e:
+            log_lines.append(f"[WARN] Could not save debug workflow JSONs: {e}")
 
         # end loop iteration
 
@@ -1408,6 +1558,13 @@ def launch_gui():
             with gr.Row():
                 # ---------------- LEFT: Workflow 1 -----------------
                 with gr.Column(scale=1):
+                    # Toggle between Normal and PromptConcat variants -------------------
+                    wf1_mode_radio = gr.Radio(
+                        choices=["Normal", "PromptConcat"],
+                        value="Normal",
+                        label="Workflow 1 Mode",
+                    )
+
                     gr.Markdown("### Workflow 1 Overrides")
 
                     # 168 – Steps KSampler 1
@@ -1445,6 +1602,18 @@ def launch_gui():
                         ("176", "height", int),
                     ])
 
+                    # --- Visibility toggle for PromptConcat-specific fields --------
+                    def _toggle_pc_fields(mode: str):
+                        vis = (mode == "PromptConcat")
+                        # Return updates for the three PromptConcat fields
+                        return (
+                            gr.update(visible=vis),
+                            gr.update(visible=vis),
+                            gr.update(visible=vis),
+                        )
+
+                    # The actual registration will occur after we create the PromptConcat components below
+
                     # 180 – Text 180
                     n180 = wf1_data.get("180", {})
                     comp_180 = gr.Textbox(label="Text - 180", value=_def_val(n180, "text", ""))
@@ -1467,6 +1636,43 @@ def launch_gui():
                     )
                     override_components.append(comp_190)
                     WF1_OVERRIDE_MAPPING.append(("190", "file_path", str))
+
+                    # 293 – PromptConcat parameters (only used in PromptConcat variant)
+                    try:
+                        wf1_pc_data = json.loads(Path(oc.WORKFLOW1_PROMPTCONCAT_JSON).read_text())
+                    except Exception:
+                        wf1_pc_data = {}
+
+                    n293_pc = wf1_pc_data.get("293", {})
+                    comp_293_base = gr.Textbox(
+                        label="Base Dir - 293",
+                        value=_def_val(n293_pc, "base_dir", ""),
+                        visible=False,
+                    )
+                    comp_293_pos = gr.Textbox(
+                        label="Positive Joiner - 293",
+                        value=_def_val(n293_pc, "positive_joiner", " "),
+                        visible=False,
+                    )
+                    comp_293_neg = gr.Textbox(
+                        label="Negative Joiner - 293",
+                        value=_def_val(n293_pc, "negative_joiner", ", "),
+                        visible=False,
+                    )
+
+                    override_components.extend([comp_293_base, comp_293_pos, comp_293_neg])
+                    WF1_OVERRIDE_MAPPING.extend([
+                        ("293", "base_dir", str),
+                        ("293", "positive_joiner", str),
+                        ("293", "negative_joiner", str),
+                    ])
+
+                    # Register the visibility callback now that the components exist
+                    wf1_mode_radio.change(
+                        _toggle_pc_fields,
+                        inputs=[wf1_mode_radio],
+                        outputs=[comp_293_base, comp_293_pos, comp_293_neg],
+                    )
 
                 # ---------------- RIGHT: Workflow 2 ----------------
                 with gr.Column(scale=1):
@@ -1674,6 +1880,7 @@ def launch_gui():
 
         # Build list of all configurable components in the exact input order
         ALL_COMPONENTS = [
+            wf1_mode_radio,
             do_nsfw_cb,
             do_face_count_cb,
             do_partial_face_cb,
@@ -1766,6 +1973,7 @@ def launch_gui():
         run_btn.click(
             fn=run_pipeline_gui,
             inputs=[
+                wf1_mode_radio,
                 do_nsfw_cb,
                 do_face_count_cb,
                 do_partial_face_cb,

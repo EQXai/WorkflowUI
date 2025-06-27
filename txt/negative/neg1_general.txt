@@ -1,0 +1,10 @@
+low resolution
+pixelated textures
+wrong lighting direction
+poor contrast
+overexposed highlights
+underexposed shadows
+unnatural colors
+posterization
+jpeg artifacts
+compression noise

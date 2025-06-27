@@ -3,10 +3,6 @@
     "inputs": {
       "delimiter": "_",
       "clean_whitespace": "true",
-      "text_a": [
-        "190",
-        0
-      ],
       "text_b": [
         "170",
         0
@@ -26,8 +22,8 @@
         0
       ],
       "text_b": [
-        "190",
-        1
+        "293",
+        0
       ]
     },
     "class_type": "Text Concatenate",
@@ -74,8 +70,8 @@
   "164": {
     "inputs": {
       "text": [
-        "190",
-        2
+        "293",
+        1
       ],
       "clip": [
         "162",
@@ -222,7 +218,7 @@
   },
   "170": {
     "inputs": {
-      "text": "Geegee1_trigger"
+      "text": "GirlNAME"
     },
     "class_type": "ttN text",
     "_meta": {
@@ -236,18 +232,6 @@
     "class_type": "ttN text",
     "_meta": {
       "title": "Replace this with the characteristics of each girl"
-    }
-  },
-  "172": {
-    "inputs": {
-      "anything": [
-        "190",
-        0
-      ]
-    },
-    "class_type": "easy showAnything",
-    "_meta": {
-      "title": "Show Any"
     }
   },
   "173": {
@@ -270,6 +254,7 @@
   },
   "175": {
     "inputs": {
+      "text_0": "GirlNAME",
       "text": [
         "160",
         0
@@ -500,21 +485,11 @@
   },
   "189": {
     "inputs": {
-      "seed": 595804359225857
+      "seed": 421094811206366
     },
     "class_type": "Seed Everywhere",
     "_meta": {
       "title": "Seed_KSampler_1"
-    }
-  },
-  "190": {
-    "inputs": {
-      "file_path": "/WorkflowUI/texts/stand1.txt",
-      "seed": 105
-    },
-    "class_type": "Load Prompt From File - EQX",
-    "_meta": {
-      "title": "Load Prompt From File - EQX"
     }
   },
   "284": {
@@ -550,11 +525,35 @@
   },
   "285": {
     "inputs": {
-      "seed": 595804359225857
+      "seed": 992028944685711
     },
     "class_type": "Seed Everywhere",
     "_meta": {
       "title": "Seed_KSampler_2"
+    }
+  },
+  "291": {
+    "inputs": {
+      "seed": 830495833936886
+    },
+    "class_type": "Seed Everywhere",
+    "_meta": {
+      "title": "Seed_PromptConcatUnified"
+    }
+  },
+  "293": {
+    "inputs": {
+      "base_dir": "/home/eqx/workflow2/txt",
+      "positive_joiner": " ",
+      "negative_joiner": ", ",
+      "seed": [
+        "291",
+        0
+      ]
+    },
+    "class_type": "Prompt Concatenate Unified - EQX",
+    "_meta": {
+      "title": "Prompt Concatenate Unified - EQX"
     }
   }
 }

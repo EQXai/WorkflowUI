@@ -25,6 +25,9 @@ import os
 from pathlib import Path
 from typing import List, Any
 import time
+import re as _re_cli
+from collections import deque
+import threading
 
 # Local modules – orchestrator_gui contains the heavy lifting.
 import orchestrator_gui as gui  # noqa: E402
@@ -37,6 +40,8 @@ try:
     from rich.table import Table
     from rich.live import Live
     from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
+    from rich.panel import Panel
+    from rich.rule import Rule
 except ImportError:
     Console = None  # Fallback if rich not installed
 
@@ -45,10 +50,10 @@ except ImportError:
 # -----------------------------------------------------------------------------
 THIS_DIR = Path(__file__).resolve().parent
 PRESET_DIR = THIS_DIR / "save_presets"
-BATCH_RUNS_INDEX = 9  # Index of *batch_runs_input* inside ALL_COMPONENTS list
+BATCH_RUNS_INDEX = 10  # Index actualizado tras añadir wf1_mode al inicio de ALL_COMPONENTS
 
 # Number of fixed parameters before dynamic_values in run_pipeline_gui
-_FIXED_COUNT = 19
+_FIXED_COUNT = 20
 # Number of LoRA override arguments expected (always 24)
 _LORA_COUNT = 24
 
@@ -66,6 +71,9 @@ OVERRIDE_WF1 = [
     ("180", "text", str),
     ("182", "steps", int),
     ("190", "file_path", str),
+    ("293", "base_dir", str),
+    ("293", "positive_joiner", str),
+    ("293", "negative_joiner", str),
 ]
 
 OVERRIDE_WF2 = [
@@ -140,11 +148,15 @@ def _normalize_values(values: List[Any]) -> List[Any]:
     if len(overrides_seg) < _OVERRIDES_LEN:
         overrides_seg += [None] * (_OVERRIDES_LEN - len(overrides_seg))
 
+    # Asegurar que la lista contiene al menos los parámetros fijos + categorías
+    if len(values) < prefix_len:
+        values += [None] * (prefix_len - len(values))
+
     sanitized = values[:prefix_len] + overrides_seg + lora_tail
     return sanitized
 
 
-def _stream_pipeline(values: List[Any], expected_runs: int | None):
+def _stream_pipeline(values: List[Any], expected_runs: int | None, wf1_mode: str):
     """Run *run_pipeline_gui* and display a Rich Live table with progress."""
 
     if Console is None:
@@ -152,6 +164,14 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None):
         return _stream_pipeline_basic(values, expected_runs)
 
     console = Console()
+    try:
+        console.clear()
+    except Exception:
+        # Fallback ANSI clear
+        print("\033c", end="")
+
+    # Extract Destination Folder for Final Images (index 9 after normalization)
+    final_dir_str = str(values[9]) if len(values) > 9 and values[9] else "-"
 
     gen = gui.run_pipeline_gui(*values)
 
@@ -161,12 +181,14 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None):
     current_attempt = 0
     # Track JSON collection per attempt
     collecting_check: dict[int, list[str]] = {}
+    recent_log = deque(maxlen=50)
 
     # Progress bar setup
+    from rich.progress import ProgressColumn
     progress = Progress(
         SpinnerColumn(),
         TextColumn("{task.description}"),
-        BarColumn(),
+        BarColumn(bar_width=None, complete_style="cyan", finished_style="green"),
         TextColumn("{task.completed}/{task.total}"),
         TimeRemainingColumn(),
     )
@@ -175,9 +197,18 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None):
     if expected_runs:
         progress_task = progress.add_task("Approved", total=expected_runs)
 
+    # Start time for statistics (needs to be available before first _render_group call)
+    start_time_cli = time.time()
+
     def _build_table() -> Table:
         saved_width = max(12, int(console.size.width * 0.2))  # 20 % ancho máx.
-        table = Table(title="Pipeline Runs", expand=True)
+        title_top = "╔═ PIPELINE RUNS ═╗"
+        title_sub = f"({wf1_mode})"
+        title_markup = (
+            f"[bold bright_cyan]{title_top}[/bold bright_cyan]\n"
+            f"[white]{title_sub}[/white]"
+        )
+        table = Table(title=title_markup, title_justify="center", expand=True)
         table.add_column("Attempt", justify="right")
         table.add_column("Status")
         table.add_column("PromptSeed", justify="right")
@@ -188,6 +219,50 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None):
 
     def _render_group():
         tbl = _build_table()
+
+        # Output dir panel -------------------------------------------------
+        from rich.panel import Panel as _Pnl
+        from rich.text import Text as _Txt
+        out_panel = _Pnl(_Txt.from_markup(f"[bold]Final dir:[/bold] {final_dir_str}"), expand=False, border_style="grey50")
+
+        # ---- statistics line ---
+        attempts_total = len(attempts)
+        accepted_cnt = len([v for v in attempts.values() if v.get("Status") == "OK"])
+        rejected_cnt = len([v for v in attempts.values() if v.get("Status") in ("NOT VALID", "Failed")])
+        target_txt = str(expected_runs) if expected_runs is not None else "∞"
+        remaining = "∞" if expected_runs is None else max(0, expected_runs - accepted_cnt)
+        elapsed_sec = int(time.time() - start_time_cli)
+        h, rem = divmod(elapsed_sec, 3600)
+        m, s = divmod(rem, 60)
+        elapsed_txt = f"{h:02d}:{m:02d}:{s:02d}"
+        eta_txt = "-"
+        if expected_runs is not None and accepted_cnt > 0:
+            rate = elapsed_sec / accepted_cnt
+            eta_sec = int(rate * remaining)
+            hh, rr = divmod(eta_sec, 3600)
+            mm, ss = divmod(rr, 60)
+            eta_txt = f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+        # ---- average time calculation ----
+        durations = [v.get("Duration") for v in attempts.values() if v.get("Status") == "OK" and v.get("Duration")]
+        avg_txt = "-" if not durations else f"{sum(durations)/len(durations):.1f}s"
+
+        stats_line = (
+            f"[bold]Attempts[/bold]: {attempts_total}   "
+            f"[bold]Accepted[/bold]: {accepted_cnt}   "
+            f"[bold]Rejected[/bold]: {rejected_cnt}   "
+            f"[bold]Objective[/bold]: {target_txt}   "
+            f"[bold]Remaining[/bold]: {remaining}   "
+            f"[bold]Elapsed[/bold]: {elapsed_txt}   "
+            f"[bold]ETA[/bold]: {eta_txt}   "
+            f"[bold]Avg/Image[/bold]: {avg_txt}"
+        )
+
+        from rich.console import Group
+        from rich.text import Text
+        stats_render = Text.from_markup(stats_line)
+        stats_panel = Panel(stats_render, expand=False, border_style="grey50")
+
         for at in sorted(attempts):
             row = attempts[at]
 
@@ -212,15 +287,10 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None):
                 row.get("SavedAs", ""),
             )
 
-        # ---- average as table caption ----
-        durations = [v.get("Duration") for v in attempts.values() if v.get("Status") == "OK" and v.get("Duration")]
-        avg_txt = "-" if not durations else f"{sum(durations)/len(durations):.1f}s"
-        tbl.caption = f"[bold]Avg Time Per Image:[/bold] {avg_txt}"
-
         if progress_task is not None:
-            from rich.console import Group
-            return Group(progress, tbl)
-        return tbl
+            separator = Rule(style="grey50")
+            return Group(separator, progress, out_panel, tbl, stats_panel)
+        return Group(out_panel, tbl, stats_panel)
 
     def _ensure_attempt(idx: int):
         if idx not in attempts:
@@ -234,13 +304,30 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None):
             }
 
     renderable = _render_group()
+
+    # Background thread to refresh live display every second so stats update even during long operations
+    stop_refresh = threading.Event()
+
+    def _auto_refresh():
+        while not stop_refresh.is_set():
+            time.sleep(1)
+            live.refresh()
+
     with Live(renderable, console=console, refresh_per_second=4, screen=False) as live:
+        refresher = threading.Thread(target=_auto_refresh, daemon=True)
+        refresher.start()
         try:
             last_len = 0
             last_approved = 0
+            last_seed_len = 0  # Track processed length of seeds log
+            last_refresh = 0.0
 
             for step in gen:
-                log_text, pending, status, metrics = step[1], step[4], step[5], step[6]
+                log_text = step[1] if len(step) > 1 else ""
+                seeds_text = step[2] if len(step) > 2 else ""
+                pending = step[5] if len(step) > 5 else ""
+                status = step[6] if len(step) > 6 else ""
+                metrics = step[7] if len(step) > 7 and step[7] is not None else ""
 
                 # Detect approved increment for progress bar
                 if progress_task is not None:
@@ -260,7 +347,11 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None):
                         # Extract attempt number and initialise placeholders
                         m = re.search(r"ATTEMPT\s+(\d+)", ln)
                         if m:
-                            current_attempt = int(m.group(1))
+                            new_attempt = int(m.group(1))
+                            if new_attempt != current_attempt and current_attempt != 0:
+                                # Keep cumulative log (no clear)
+                                pass
+                            current_attempt = new_attempt
                             _ensure_attempt(current_attempt)
                             attempt_starts[current_attempt] = time.time()
                     elif ln.startswith("[SEED]"):
@@ -275,9 +366,33 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None):
                         if "prompt" in ln_lower:
                             # Prompt loader seed (node 190)
                             attempts[current_attempt]["PromptSeed"] = seed_val
-                        elif "seed everywhere" in ln_lower and not attempts[current_attempt]["ImageSeed"].isdigit():
-                            # First occurrence corresponds to image seed (node 189)
+                        elif (
+                            ("seed_ksampler_1" in ln_lower or "seed_ksampler 1" in ln_lower)
+                            or ("seed_ksampler_2" in ln_lower or "seed_ksampler 2" in ln_lower)
+                            or "seed everywhere" in ln_lower  # compat
+                        ) and not attempts[current_attempt]["ImageSeed"].isdigit():
+                            # First occurrence corresponds to image seed (nodes 189/285) or legacy Seed Everywhere
                             attempts[current_attempt]["ImageSeed"] = seed_val
+                    elif ln.startswith("[CHECK]") and (
+                        "flagged as NSFW" in ln
+                        or "More than one face" in ln
+                        or "Partial face" in ln
+                    ):
+                        _ensure_attempt(current_attempt)
+                        attempts[current_attempt]["Status"] = "NOT VALID"
+                        attempts[current_attempt]["Checks"] = "NO"
+                        # Use the part of the line after '[CHECK]' as reason (trimmed)
+                        reason = ln.split("[CHECK]", 1)[1].strip()
+                        # Remove verbose suffixes
+                        reason = _re_cli.sub(r"\.\s*Pipeline stops\.*", "", reason, flags=_re_cli.I)
+                        reason = _re_cli.sub(r"\s*and stop option is active\.*", "", reason, flags=_re_cli.I)
+                        reason = reason.strip()
+                        # Only set if not already set to NSFW-<cat>
+                        if not attempts[current_attempt].get("SavedAs", "").startswith("NSFW-"):
+                            attempts[current_attempt]["SavedAs"] = reason
+                    elif ln.startswith("[CHECK] Running external checks"):
+                        _ensure_attempt(current_attempt)
+                        attempts[current_attempt]["Status"] = "Check"
                     elif ln.startswith("[CHECK] Results:"):
                         _ensure_attempt(current_attempt)
                         # Start collecting multiline JSON
@@ -292,18 +407,22 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None):
                     elif ln.startswith("[WF1] Running Workflow1"):
                         _ensure_attempt(current_attempt)
                         attempts[current_attempt]["Status"] = "WF1"
-                    elif ln.startswith("[CHECK] Running external checks"):
+                    elif "pipeline stops" in ln.lower():
                         _ensure_attempt(current_attempt)
-                        attempts[current_attempt]["Status"] = "Check"
-                    elif ln.startswith("[WF2] Running Workflow2"):
-                        _ensure_attempt(current_attempt)
-                        attempts[current_attempt]["Status"] = "WF2"
-                        # Checks passed successfully
-                        attempts[current_attempt]["Checks"] = "OK"
-                    elif "pipeline stops" in ln.lower() or "error" in ln.lower():
+                        attempts[current_attempt]["Status"] = "NOT VALID"
+                        attempts[current_attempt]["Checks"] = "NO"
+                        if not attempts[current_attempt]["SavedAs"] or attempts[current_attempt]["SavedAs"] == "None":
+                            attempts[current_attempt]["SavedAs"] = "Checks failed"
+                    elif "error" in ln.lower():
                         _ensure_attempt(current_attempt)
                         attempts[current_attempt]["Status"] = "Failed"
                         attempts[current_attempt]["Checks"] = "Failed"
+                    elif ln.startswith("[WF2] Running Workflow2"):
+                        _ensure_attempt(current_attempt)
+                        attempts[current_attempt]["Status"] = "WF2"
+                        # If checks were pending, mark them as OK now
+                        if attempts[current_attempt]["Checks"] in ("Pending", "-", "NO"):
+                            attempts[current_attempt]["Checks"] = "OK"
 
                     # ---------------- collect check JSON -------------------
                     if collecting_check.get(current_attempt):
@@ -314,7 +433,12 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None):
                                 res = json.loads(blob)
                                 chk_parts = []
                                 if res.get("is_nsfw") is not None:
-                                    chk_parts.append("NSFW" if res["is_nsfw"] else "SFW")
+                                    if res["is_nsfw"]:
+                                        cat = res.get("nsfw_category", "?")
+                                        chk_parts.append(f"NSFW-{cat}")
+                                        attempts[current_attempt]["SavedAs"] = f"NSFW-{cat}"
+                                    else:
+                                        chk_parts.append("SFW")
                                 if "face_count" in res and res["face_count"] >= 0:
                                     chk_parts.append(f"faces:{res['face_count']}")
                                 if res.get("is_partial_face") is not None:
@@ -324,9 +448,44 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None):
                                 attempts[current_attempt]["Checks"] = "-"
                             collecting_check.pop(current_attempt, None)
 
-                # Update renderable in place ---------------------------------
-                renderable = _render_group()
-                live.update(renderable, refresh=True)
+                # -------------- Parse Seeds Log (panel) -----------------------
+                seeds_lines = seeds_text.splitlines()
+                new_seed_lines = seeds_lines[last_seed_len:]
+                last_seed_len = len(seeds_lines)
+
+                seed_attempt = None
+                for s_ln in new_seed_lines:
+                    if s_ln.startswith("Attempt"):
+                        m_at = re.search(r"Attempt\s+(\d+)", s_ln)
+                        if m_at:
+                            seed_attempt = int(m_at.group(1))
+                            _ensure_attempt(seed_attempt)
+                        continue
+
+                    if seed_attempt is None:
+                        continue
+
+                    # PromptSeed detection depending on mode
+                    if wf1_mode.lower().startswith("prompt") and "PromptConcat seed" in s_ln:
+                        m = re.search(r":\s*(\d+)", s_ln)
+                        if m:
+                            attempts[seed_attempt]["PromptSeed"] = m.group(1)
+                    elif not wf1_mode.lower().startswith("prompt") and "Prompt loader seed" in s_ln:
+                        m = re.search(r":\s*(\d+)", s_ln)
+                        if m:
+                            attempts[seed_attempt]["PromptSeed"] = m.group(1)
+
+                    # Image seed always from Seed_KSampler_1 (189)
+                    if "Seed_KSampler_1" in s_ln:
+                        m = re.search(r":\s*(\d+)", s_ln)
+                        if m:
+                            attempts[seed_attempt]["ImageSeed"] = m.group(1)
+
+                    # Append every processed line to rolling log
+                    recent_log.append(s_ln)
+
+                # Update renderable in place after processing current batch
+                live.update(_render_group(), refresh=True)
 
         except KeyboardInterrupt:
             console.print("[bold red]\n[CANCEL][/bold red] KeyboardInterrupt received. Exiting…")
@@ -336,6 +495,11 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None):
                     pass
             except Exception:
                 pass
+        finally:
+            if progress_task is not None:
+                progress.stop_task(progress_task)
+            stop_refresh.set()
+            refresher.join(timeout=1)
 
     console.print("[bold green]Done[/bold green]")
 
@@ -383,8 +547,7 @@ def main(argv: list[str] | None = None):
     parser.add_argument(
         "runs",
         nargs="?",
-        type=int,
-        help="Desired number of successful final images (overrides stored preset)",
+        help="Number of successful images to generate or 'nolimit' for endless mode",
     )
     args = parser.parse_args(argv)
 
@@ -392,22 +555,51 @@ def main(argv: list[str] | None = None):
     values = _load_preset_values(args.preset)
 
     # 2. Optionally override the Batch Runs value ---------------------------
-    if args.runs is not None:
+    if args.runs is not None and str(args.runs).lower() != "nolimit":
         if BATCH_RUNS_INDEX >= len(values):
             # Extend list if batch index missing
             values += [None] * (BATCH_RUNS_INDEX - len(values) + 1)
-        values[BATCH_RUNS_INDEX] = int(args.runs)
+        try:
+            values[BATCH_RUNS_INDEX] = int(args.runs)
+        except ValueError:
+            sys.exit("[ERROR] 'runs' must be an integer or 'nolimit'.")
+
+    # Handle nolimit: force endless_until_cancel flag (index 11)
+    if str(args.runs).lower() == "nolimit":
+        # Ensure list is long enough
+        endless_idx = 11
+        if endless_idx >= len(values):
+            values += [None] * (endless_idx - len(values) + 1)
+        values[endless_idx] = True
 
     # 3. Trim / pad to expected length --------------------------------------
     values = _normalize_values(values)
 
+    # Clear terminal before starting rich interface
+    try:
+        if os.name == "nt":
+            os.system("cls")
+        else:
+            os.system("clear")
+    except Exception:
+        print("\033[2J\033[H", end="")
+
+    # Determine WF1 mode from first value (index 0)
+    wf1_mode = values[0] if values else "Unknown"
+    print(f"[INFO] Starting pipeline (WF1 Mode: {wf1_mode})… Press Ctrl+C to cancel.")
+
     # Determine expected runs (for progress bar)
-    endless_mode = bool(values[10]) if len(values) > 10 else False
-    expected_runs = None if endless_mode else int(values[9]) if len(values) > 9 else None
+    endless_mode = bool(values[11]) if len(values) > 11 else False
+
+    if str(args.runs).lower() == "nolimit":
+        expected_runs = None
+    elif args.runs is not None:
+        expected_runs = int(args.runs)
+    else:
+        expected_runs = None if endless_mode else None
 
     # 4. Execute the pipeline ----------------------------------------------
-    print("[INFO] Starting pipeline… Press Ctrl+C to cancel.")
-    _stream_pipeline(values, expected_runs)
+    _stream_pipeline(values, expected_runs, wf1_mode)
     print("[INFO] Pipeline finished.")
 
 
