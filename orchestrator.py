@@ -58,9 +58,9 @@ DEFAULT_OUTPUT_DIR = os.getenv("COMFY_OUTPUT_DIR", _detect_default_output_dir())
 
 WORKFLOW_DIR = Path(os.getenv("WORKFLOW_DIR", str(Path(__file__).parent / "workflows")))
 
-# Paths to the two workflows used by the pipeline (relative to project root)
+# Paths to the workflows used by the pipeline (relative to project root)
 WORKFLOW1_JSON = str(WORKFLOW_DIR / "Workflow1.json")
-WORKFLOW1_PROMPTCONCAT_JSON = str(WORKFLOW_DIR / "Workflow1_PromptConcat.json")  # New variant with PromptConcat
+WORKFLOW1_PROMPTCONCAT_JSON = str(WORKFLOW_DIR / "Workflow1_PromptConcatenate.json")
 WORKFLOW2_JSON = str(WORKFLOW_DIR / "Workflow2.json")
 
 # Node ID from Workflow2 that loads an image from a path. Adjust if you change

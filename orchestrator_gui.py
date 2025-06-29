@@ -1,81 +1,92 @@
-import os
-import time
+# =============================================================================
+# IMPORTS - Organized and Optimized
+# =============================================================================
+
+# Standard library imports
 import json
 import math
+import os
 import random
-from pathlib import Path
-from typing import List, Dict, Any
-
-import gradio as gr
-from PIL import Image
 import shutil
 import tempfile
-import numpy as np  # NEW: for beep sound generation
+import time
+from pathlib import Path
+from typing import Any, Dict, List
 
-# Local modules
-import orchestrator as oc  # our previously created orchestrator.py
+# Third-party imports
+import gradio as gr
+import numpy as np
+from PIL import Image
 
-# Constants
-DEFAULT_OUTPUT_DIR = Path(oc.DEFAULT_OUTPUT_DIR)
+# Local module imports
+import orchestrator as oc
+from app_config import CONFIG, CSS_STYLES
+from gui_utils import (
+    create_number_input, create_textbox_input, create_log_textbox,
+    get_default_node_value, load_workflow_data, apply_workflow_edits,
+    set_workflow_input_by_id, set_workflow_seed, load_image_safe,
+    get_notification_sound, extract_filename_base, populate_lora_from_directory,
+    save_preset, load_preset, list_presets, delete_preset,
+    validate_pipeline_config, create_visibility_toggle_callback
+)
 
-# Directory where preset JSON files will be stored
-PRESET_DIR = Path(__file__).resolve().parent / "save_presets"
-PRESET_DIR.mkdir(parents=True, exist_ok=True)
+# Pipeline utility imports
+from pipeline_utils import (
+    parse_dynamic_values, process_auto_lora, create_console_logger,
+    setup_temporary_prompt_file, prepare_workflows, apply_lora_overrides,
+    set_prompt_file, generate_seeds, setup_workflow_seeds,
+    extract_prompts_normal, extract_filename_base as extract_filename_base_util,
+    calculate_target_successes, should_continue_batch, build_allowed_categories,
+    evaluate_check_results
+)
 
-# Extra constants for advanced check configuration
+# PromptConcatenate utility imports  
+from promptconcat_utils import (
+    parse_promptconcat_configs, inject_promptconcat_preview, inject_dynamic_prompts,
+    get_promptconcat_debug_str, setup_characteristics_text, is_promptconcat_mode
+)
+from ui_sections import (
+    create_preset_section, create_main_controls_section, create_status_boxes_section,
+    create_directory_section, create_advanced_checks_section, create_seed_settings_section,
+    create_output_prompts_section, create_images_gallery_section, create_logs_section
+)
+from ui_callbacks import (
+    filter_presets, save_preset_wrapper, load_preset_wrapper, delete_preset_wrapper,
+    rename_preset, export_preset, import_preset, update_preset_selector,
+    validate_pipeline_settings, populate_lora_slots, reset_promptconcat_counters,
+    generate_test_prompts, clear_test_results, apply_test_results_to_main,
+    show_component_temporarily, hide_component, reset_to_defaults
+)
 from run_checks import CATEGORY_DISPLAY_MAPPINGS, DEFAULT_NSFW_CATEGORIES
 
-# -----------------------------------------------------------------------------
-# Constants
-# -----------------------------------------------------------------------------
+# =============================================================================
+# CONSTANTS - Now managed by centralized configuration
+# =============================================================================
 
-MAX_SEED_VALUE = 18446744073709551615  # Upper limit for any seed value (uint64 max)
+DEFAULT_OUTPUT_DIR = Path(oc.DEFAULT_OUTPUT_DIR)
 
-# NEW: Maximum number of images kept in the on-screen gallery
-MAX_GALLERY_IMAGES = 20  # Only the last 20 approved images will be shown
+# =============================================================================
+# GLOBAL STATE VARIABLES - Centralized Management
+# =============================================================================
 
-# ComfyUI internally clamps seeds to 32-bit.  Using larger numbers results in a
-# different value being applied than the one shown in the log.  We therefore
-# define an explicit cap that matches ComfyUI's behaviour and make sure every
-# seed we generate respects it.
-COMFY_MAX_SEED = 0xFFFFFFFF  # 4_294_967_295
+# Workflow mapping information (populated during GUI build)
+WF1_MAPPING: List[tuple[str, str, type]] = []  # (node_id, input_key, original_type)
+WF2_MAPPING: List[tuple[str, str, type]] = []
 
-# -------------------------------------------------------------
-# Dynamic form helpers for workflow editing
-# -------------------------------------------------------------
-
-# Will be populated during GUI build so that run_pipeline_gui can
-# access the mapping information.
-WF1_MAPPING: list[tuple[str, str, type]] = []  # (node_id, input_key, original_type)
-WF2_MAPPING: list[tuple[str, str, type]] = []
-
-# Flag used to signal cancellation from the GUI
+# Application state variables
 CANCEL_REQUESTED = False
-
-# External seed counter that persists across pipeline invocations while the
-# application is running. It is only used when the user selects the
-# "Incremental" seed mode.
 GLOBAL_SEED_COUNTER: int | None = None
-
-# Global counters for statistics
 GLOBAL_APPROVED_COUNT = 0
 GLOBAL_REJECTED_COUNT = 0
 
-# Placeholder beep generator -------------------------------------------------
+# PromptConcatenate state (now managed by promptconcat_utils.py)
+# PROMPTCONCAT_INCREMENTAL_COUNTERS and PROMPTCONCAT_DEBUG_LOG moved to promptconcat_utils.py
 
-AUDIO_FILE = Path(__file__).resolve().parent / "audio" / "notify.mp3" # New constant
+# Testing panel state
+LAST_TEST_RESULTS: Dict[str, Any] = {}
 
-def _get_notification_sound():
-    """Return a sound reference accepted by gr.Audio: filepath if exists else tuple(sr, arr)."""
-    if AUDIO_FILE.exists():
-        return str(AUDIO_FILE)
-    # fallback beep
-    duration = 0.6
-    freq = 880
-    sr = 44100
-    t = np.linspace(0, duration, int(sr*duration), False, dtype=np.float32)
-    tone = 0.25 * np.sin(2 * np.pi * freq * t)
-    return sr, tone.astype(np.float32)
+# Notification sound function (using centralized utility)
+_get_notification_sound = get_notification_sound
 
 def _request_cancel():
     """Triggered by Cancel button: stop execution and update indicators."""
@@ -85,7 +96,8 @@ def _request_cancel():
         "Pending: 0",
         "Cancelled",
         f"Approved: {GLOBAL_APPROVED_COUNT} | Rejected: {GLOBAL_REJECTED_COUNT}",
-        str(AUDIO_FILE) if AUDIO_FILE.exists() else None,
+        str(CONFIG.paths.AUDIO_FILE) if CONFIG.paths.AUDIO_FILE.exists() else None,
+        "Execution cancelled by user.",
     )
 
 # -------------------------------------------------------------
@@ -157,94 +169,17 @@ def _build_workflow_editor(json_path: str, highlight_ids: list[str] | None = Non
     return comps, mapping
 
 
-def _apply_edits_to_workflow(original_path: str, mapping: list[tuple[str, str, type]], values: list[str]) -> str:
-    """Create a temporary copy of *original_path* applying the edited *values*.
+# Using centralized utility function
+_apply_edits_to_workflow = apply_workflow_edits
 
-    Returns the path to the temporary JSON file.
-    """
-    data = json.loads(Path(original_path).read_text())
-
-    for (node_id, key, typ), val in zip(mapping, values):
-        # Convert string input back to original type when possible
-        try:
-            if typ is bool:
-                cast_val = val if isinstance(val, bool) else val.lower() == "true"
-            elif typ is int:
-                cast_val = int(val)
-            elif typ is float:
-                cast_val = float(val)
-            elif typ in (list, dict):
-                # Expect JSON string representation
-                cast_val = json.loads(val)
-            else:
-                cast_val = val
-        except Exception:
-            cast_val = val  # fallback to raw string
-
-        # Special case: resolve node 190 file_path relative to the "texts" folder
-        if node_id == "190" and key == "file_path":
-            # If value is not absolute, prepend the texts directory located next to this script
-            try:
-                from pathlib import Path as _P
-                _base = _P(__file__).resolve().parent / "texts"
-                _resolved = _P(cast_val)
-                if not _resolved.is_absolute():
-                    cast_val = str((_base / _resolved).resolve())
-                else:
-                    cast_val = str(_resolved)
-            except Exception:
-                # Fallback to original value if something goes wrong
-                pass
-
-        if node_id in data and "inputs" in data[node_id]:
-            data[node_id]["inputs"][key] = cast_val
-
-    tmp_fd, tmp_path = tempfile.mkstemp(suffix="_workflow.json")
-    os.close(tmp_fd)
-    Path(tmp_path).write_text(json.dumps(data, indent=2))
-    return tmp_path
-
-# -----------------------------------------------------------------------------
-# Custom CSS to show full portrait images without cropping (object-fit: contain)
-# -----------------------------------------------------------------------------
-
-CSS = """
-+.pending-box {
-    position: fixed;
-    top: 10px;
-    right: 10px;
-    background-color: rgba(255, 255, 255, 0.9);
-    border: 1px solid #ccc;
-    padding: 6px 10px;
-    font-weight: bold;
-    z-index: 1000;
-}
-
-#results-gallery img {
-    object-fit: contain !important;
-    width: 100% !important;
-    height: auto !important;
-}
-
-/* Highlight container for featured nodes */
-+.highlight-box {
-    border: 3px solid #f8e71c !important; /* bright yellow */
-    background-color: rgba(248, 231, 28, 0.05); /* subtle yellow tint */
-    padding: 10px !important;
-    margin-bottom: 12px !important;
-    border-radius: 6px;
-}
-"""
+# CSS styles now managed by centralized configuration
 
 # -----------------------------------------------------------------------------
 # Helper functions
 # -----------------------------------------------------------------------------
 
-def _load_img(path: Path) -> Image.Image | None:
-    try:
-        return Image.open(path).convert("RGB")
-    except Exception:
-        return None
+# Using centralized utility function
+_load_img = load_image_safe
 
 
 def run_pipeline_gui(
@@ -288,6 +223,7 @@ def run_pipeline_gui(
             status_str,
             _metrics_str(),
             sound_placeholder,
+            _promptconcat_debug_str(),
         )
 
     status_str = "Idle"
@@ -296,274 +232,61 @@ def run_pipeline_gui(
     global CANCEL_REQUESTED, GLOBAL_SEED_COUNTER
     CANCEL_REQUESTED = False  # reset at start of each invocation
 
-    # Detect selected WF1 variant ------------------------------------------
-    is_promptconcat = wf1_mode.lower().startswith("prompt")
+    # Workflow mode determination and parameter parsing using utilities
+    is_promptconcat = is_promptconcat_mode(wf1_mode)
 
-    # Split dynamic_values into nsfw category toggles and workflow edits
+    # Parse dynamic values using centralized utility
     num_nsfw_cats = len([k for k in CATEGORY_DISPLAY_MAPPINGS.keys() if k != "NOT_DETECTED"])
-    nsfw_categories = dynamic_values[:num_nsfw_cats]
-    wf_edit_values = dynamic_values[num_nsfw_cats:]
+    parsed_values = parse_dynamic_values(dynamic_values, num_nsfw_cats, len(WF1_MAPPING), len(WF2_MAPPING))
+    
+    # Extract parsed components
+    nsfw_categories = parsed_values['nsfw_categories']
+    wf1_edit_vals = parsed_values['wf1_edit_vals']
+    wf2_edit_vals = parsed_values['wf2_edit_vals']
+    auto_lora_flag = parsed_values['auto_lora_flag']
+    auto_lora_dir = parsed_values['auto_lora_dir']
+    lora244_paths = parsed_values['lora244_paths']
+    lora244_strengths = parsed_values['lora244_strengths']
+    lora307_paths = parsed_values['lora307_paths']
+    lora307_strengths = parsed_values['lora307_strengths']
 
-    wf1_edit_vals = wf_edit_values[: len(WF1_MAPPING)]
-    wf2_edit_vals = wf_edit_values[len(WF1_MAPPING) : len(WF1_MAPPING)+len(WF2_MAPPING)]
+    # Process auto-fill LoRA using centralized utility
+    lora244_paths, lora307_paths, override_loras_244_flag, override_loras_307_flag = process_auto_lora(
+        auto_lora_flag, auto_lora_dir, lora244_paths, lora244_strengths, lora307_paths, lora307_strengths
+    )
 
-    # -------------------------------------------------------------
-    # Parse extra LoRA controls: auto-fill checkbox & directory path
-    # -------------------------------------------------------------
-    extra_start = len(WF1_MAPPING) + len(WF2_MAPPING)
-    auto_lora_flag: bool = False
-    auto_lora_dir: str = ""
+    # Initialize logging system using centralized utility
+    log_lines: List[str] = create_console_logger()
 
-    if len(wf_edit_values) >= extra_start + 2:
-        auto_lora_flag = bool(wf_edit_values[extra_start])
-        auto_lora_dir = str(wf_edit_values[extra_start + 1]).strip()
+    # Setup temporary prompt file using centralized utility
+    try:
+        tmp_prompt_file = setup_temporary_prompt_file(load_prompts_directly, prompt_list_str)
+    except ValueError as e:
+        return None, {}, "", str(e), None, "In Queue: 0", "Error", _metrics_str(), None, "No prompt list provided."
+    except RuntimeError as e:
+        return None, {}, "", str(e), None, "In Queue: 0", "Error", _metrics_str(), None, f"Error creating temporary file: {e}"
 
-    remaining_vals = wf_edit_values[extra_start + 2:]
+    # Prepare workflows using centralized utility
+    wf1_path_mod, wf2_path_mod = prepare_workflows(is_promptconcat, wf1_edit_vals, wf2_edit_vals, WF1_MAPPING, WF2_MAPPING)
 
-    # Extract LoRA override values --------------------------------------------------
-    # Layout (after the two extra fields):
-    #  [0:6]   -> 6 LoRA paths for node 244
-    #  [6:12]  -> 6 strength values for node 244
-    #  [12:18] -> 6 paths for node 307
-    #  [18:24] -> 6 strengths for node 307
+    # Apply LoRA overrides using centralized utility
+    apply_lora_overrides(wf2_path_mod, override_loras_244_flag, override_loras_307_flag,
+                        lora244_paths, lora244_strengths, lora307_paths, lora307_strengths, log_lines)
 
-    override_loras_244_flag = False
-    override_loras_307_flag = False
+    # Setup prompt file and characteristics using centralized utilities
+    if load_prompts_directly and tmp_prompt_file:
+        set_prompt_file(wf1_path_mod, tmp_prompt_file)
+        setup_characteristics_text(wf1_path_mod, characteristics_text, log_lines)
 
-    lora244_paths: list[str] = [""] * 6
-    lora244_strengths: list[float] = [0.7, 0.3, 0.3, 0.3, 0.3, 0.3]
+        # Setup PromptConcatenate configuration and preview injection
+        if is_promptconcat:
+            # Parse PromptConcatenate configurations
+            file_configs = parse_promptconcat_configs(dynamic_values, num_nsfw_cats, len(WF1_MAPPING), len(WF2_MAPPING))
+            # Inject preview prompts into workflow
+            inject_promptconcat_preview(wf1_path_mod, file_configs, log_lines)
 
-    lora307_paths: list[str] = [""] * 6
-    lora307_strengths: list[float] = [0.7, 0.3, 0.3, 0.3, 0.3, 0.3]
-
-    if remaining_vals and len(remaining_vals) >= 24:
-        idx = 0
-        lora244_paths = [str(v).strip() for v in remaining_vals[idx:idx+6]]; idx += 6
-        lora244_strengths = [float(v) for v in remaining_vals[idx:idx+6]]; idx += 6
-
-        lora307_paths = [str(v).strip() for v in remaining_vals[idx:idx+6]]; idx += 6
-        lora307_strengths = [float(v) for v in remaining_vals[idx:idx+6]]
-
-        override_loras_244_flag = any(p for p in lora244_paths)
-        override_loras_307_flag = any(p for p in lora307_paths)
-
-    # --------------------------------------------------
-    # Auto-fill LoRA lists from directory if requested
-    # --------------------------------------------------
-    if auto_lora_flag and auto_lora_dir:
-        try:
-            dir_path = Path(auto_lora_dir).expanduser().resolve()
-            if not dir_path.is_dir():
-                raise FileNotFoundError(f"Directory not found: {dir_path}")
-
-            # Collect all .safetensors files (recursive)
-            all_files = sorted(dir_path.rglob("*.safetensors"))
-            if not all_files:
-                raise FileNotFoundError("No .safetensors files found in directory.")
-
-            # Identify flux realism file for lora_1
-            flux_file = None
-            for p in all_files:
-                if p.name.lower() == "flux_realism_lora.safetensors":
-                    flux_file = p
-                    break
-
-            # Helper to convert absolute path to relative from 'lora/'
-            def _rel_from_lora(p: Path) -> str:
-                parts = list(p.parts)
-                if "lora" in parts:
-                    idx = parts.index("lora")
-                    rel = Path(*parts[idx+1:])
-                    return str(rel)
-                return p.name  # fallback: just filename
-
-            if flux_file is not None:
-                rel_flux = _rel_from_lora(flux_file)
-                lora244_paths[0] = rel_flux
-                lora307_paths[0] = rel_flux
-            else:
-                # leave slot empty but note warning
-                pass
-
-            # Prepare pool excluding flux_file
-            pool = [p for p in all_files if p != flux_file]
-            random.shuffle(pool)
-
-            selected = pool[:10]
-            # Fill node 244 slots 2-6 (index 1-5)
-            for i in range(5):
-                if i < len(selected):
-                    lora244_paths[i+1] = _rel_from_lora(selected[i])
-            # Fill node 307 slots 2-6
-            for i in range(5):
-                idx_sel = i + 5
-                if idx_sel < len(selected):
-                    lora307_paths[i+1] = _rel_from_lora(selected[idx_sel])
-
-            override_loras_244_flag = True
-            override_loras_307_flag = True
-        except Exception as e_auto:
-            # Log warning but do not fail pipeline
-            pass
-
-    # Initialise log list early so we can safely append warnings **and**
-    # mirror them to the terminal.  Using a tiny helper class avoids touching
-    # every individual `log_lines.append(...)` throughout the function.
-
-    from datetime import datetime as _dt
-
-    def _fmt_console(line: str) -> str:
-        """Return *line* prettified for console consumption.
-
-        1. Adds HH:MM:SS timestamp.
-        2. Ensures a blank line before each ATTEMPT separator for clarity.
-        3. Indents secondary messages to highlight the overall flow.
-        """
-
-        ts = _dt.now().strftime("%H:%M:%S")
-
-        if line.startswith("========== ATTEMPT"):
-            # visual separation between attempts
-            return f"\n{ts}  {line}\n"
-
-        # Primary workflow stages (WF1/WF2/Checks)
-        for tag in ("[WF1]", "[WF2]", "[CHECK]", "[FINAL]", "[SEED]", "[CANCEL]", "[WARN]", "[CLEANUP]"):
-            if line.startswith(tag):
-                return f"{ts}  {line}"
-
-        # Default: indent slightly to group under previous header
-        return f"{ts}    {line}"
-
-
-    class _ConsoleList(list):
-        """List that mirrors additions to the terminal with nice formatting."""
-
-        def _print(self, txt: str):
-            try:
-                if not hasattr(self, "_first_print_done"):
-                    self._first_print_done = True
-                else:
-                    # Add blank line before most entries for visual separation,
-                    # except when printing consecutive lines of a JSON block
-                    stripped = txt.lstrip()
-                    if not (stripped.startswith("{") or stripped.startswith("}") or stripped.startswith("\"") ):
-                        print("", flush=False)
-                print(_fmt_console(txt), flush=True)
-            except Exception:
-                pass  # don't break on logging errors
-
-        def append(self, item):  # type: ignore[override]
-            super().append(item)
-            self._print(item)
-
-        def extend(self, items):  # type: ignore[override]
-            super().extend(items)
-            for _i in items:
-                self._print(_i)
-
-    log_lines: List[str] = _ConsoleList()
-
-    # ----------------------------------------------------------------------
-    # If the user enabled direct prompt loading, create a temporary prompts
-    # file and inject its path into the workflow (node class
-    # "Load Prompt From File - EQX", expected id 190).
-    # ----------------------------------------------------------------------
-
-    tmp_prompt_file: str | None = None
-    if load_prompts_directly:
-        prompt_list_clean = (prompt_list_str or "").strip()
-        if not prompt_list_clean:
-            # Nothing to load – fail fast with message
-            return None, {}, "Prompt list is empty while the direct prompt option is enabled.", None, "In Queue: 0", "Error", _metrics_str(), None
-
-        try:
-            tmp_fd, tmp_path = tempfile.mkstemp(suffix="_prompts.txt")
-            os.close(tmp_fd)
-            Path(tmp_path).write_text(prompt_list_clean)
-            tmp_prompt_file = tmp_path
-        except Exception as e:
-            return None, {}, f"Could not create temporary prompt file: {e}", None, "In Queue: 0", "Error", _metrics_str(), None
-
-    # ----------------------------------------------------------------------
-    # Build modified workflow copies according to edits (only once at start
-    # of batch). They will be reused across attempts, but seed will still be
-    # incremented later as before.
-    # ----------------------------------------------------------------------
-
-    wf1_original_path = oc.WORKFLOW1_PROMPTCONCAT_JSON if is_promptconcat else oc.WORKFLOW1_JSON
-    wf1_path_mod = _apply_edits_to_workflow(wf1_original_path, WF1_MAPPING, wf1_edit_vals)
-    wf2_path_mod = _apply_edits_to_workflow(oc.WORKFLOW2_JSON, WF2_MAPPING, wf2_edit_vals)
-
-    # --------------------------------------------------
-    # Apply LoRA overrides if the user enabled either panel
-    # --------------------------------------------------
-    if override_loras_244_flag or override_loras_307_flag:
-        try:
-            data_wf2 = json.loads(Path(wf2_path_mod).read_text())
-
-            # Helper to patch a single node
-            def _patch_node(node_id: str, paths: list[str], strengths: list[float]):
-                node = data_wf2.get(node_id)
-                if not (node and isinstance(node, dict)):
-                    return
-                for i in range(1, 7):
-                    path_val = paths[i - 1]
-                    strength_val = strengths[i - 1]
-                    if path_val:  # Only override if user provided a path
-                        node.setdefault("inputs", {})[f"lora_{i}"] = {
-                            "on": True,
-                            "lora": path_val,
-                            "strength": strength_val,
-                        }
-
-            if override_loras_244_flag:
-                _patch_node("244", lora244_paths, lora244_strengths)
-
-            if override_loras_307_flag:
-                _patch_node("307", lora307_paths, lora307_strengths)
-
-            # --- Force Workflow 2 to save images in the root output dir ----
-            # Node 249 contains the path used by SaveImage_EQX (node 227) as
-            #     "output_path".  Its default value "POR_DEFINIR" provoca la
-            # creación de carpetas intermedias.  Lo reemplazamos por "" para
-            # que guarde directamente en la ruta *output_dir* sin sub-carpetas.
-            try:
-                if "249" in data_wf2:
-                    data_wf2["249"].setdefault("inputs", {})["text"] = ""
-            except Exception:
-                pass
-
-            Path(wf2_path_mod).write_text(json.dumps(data_wf2, indent=2))
-        except Exception as e:
-            log_lines.extend([f"[WARN] Could not apply LoRA overrides: {e}"])
-
-    # When using direct prompt loading, patch node 190's file_path to our temp file
-    if load_prompts_directly and tmp_prompt_file and not is_promptconcat:
-        def _set_prompt_file(path_json: str, file_path: str, node_class: str = "Load Prompt From File - EQX") -> bool:
-            try:
-                data_local = json.loads(Path(path_json).read_text())
-                for node in data_local.values():
-                    if isinstance(node, dict) and node.get("class_type") == node_class:
-                        node.setdefault("inputs", {})["file_path"] = str(file_path)
-                        Path(path_json).write_text(json.dumps(data_local, indent=2))
-                        return True
-            except Exception:
-                pass
-            return False
-
-        _set_prompt_file(wf1_path_mod, tmp_prompt_file)
-
-    if characteristics_text and characteristics_text.strip():
-        try:
-            data_local = json.loads(Path(wf1_path_mod).read_text())
-            if "171" in data_local:
-                data_local["171"].setdefault("inputs", {})["text"] = characteristics_text.strip()
-                Path(wf1_path_mod).write_text(json.dumps(data_local, indent=2))
-        except Exception as e:
-            log_lines.extend([f"[WARN] Could not set characteristics text for node 171: {e}"])
-
-    # ----------------------------------------------------------------------
-    # (The debug copy is now saved **inside** the attempt loop, once all
+        # ----------------------------------------------------------------------
+        # (The debug copy is now saved **inside** the attempt loop, once all
     #  seed values have been patched.  This guarantees that the JSON files
     #  written to WF_debug reflect exactly the parameters sent to ComfyUI.)
     # ----------------------------------------------------------------------
@@ -571,17 +294,14 @@ def run_pipeline_gui(
     success_count = 0
     attempt = 0
 
-    # Determine the target number of successful images. If "endless" mode is
-    # enabled we will iterate until the user presses **Cancel** from the UI.
+    # Calculate target successes and build checks configuration using utilities
+    target_successes = calculate_target_successes(endless_until_cancel, batch_runs)
     if endless_until_cancel:
-        target_successes = math.inf
-        # keep a sane default for batch_runs to avoid type issues later on
         batch_runs = max(1, int(batch_runs)) if batch_runs is not None else 1
     else:
         batch_runs = max(1, int(batch_runs))
-        target_successes = batch_runs
 
-    # 1. Determine selected checks --------------------------------------------------
+    # Build checks list
     checks: List[str] = []
     if do_nsfw:
         checks.append("nsfw")
@@ -591,7 +311,7 @@ def run_pipeline_gui(
         checks.append("partial_face")
 
     if not checks:
-        return None, {}, "You must select at least one check.", None, "In Queue: 0", "Error", _metrics_str(), None
+        return None, {}, "", "You must select at least one check.", None, "In Queue: 0", "Error", _metrics_str(), None, "No checks selected."
 
     # Prepare output directories --------------------------------------------
     output_dir = Path(output_dir_str) if output_dir_str else DEFAULT_OUTPUT_DIR
@@ -604,14 +324,31 @@ def run_pipeline_gui(
     album_images: List[Image.Image] = []
 
     # Collects human-readable seed information shown in the GUI
-    seeds_log_lines: List[str] = ["=== Seeds Log (per attempt) ==="]
+    seeds_log_lines: List[str] = []
     def _seeds_log_str():
         return "\n".join(seeds_log_lines)
+    
+    # Collects human-readable prompt information shown in the GUI
+    prompt_log_lines: List[str] = []
+    def _prompt_log_str():
+        return "\n".join(prompt_log_lines)
+    
+    # Helper function to format debug log using centralized utility
+    def _promptconcat_debug_str():
+        return get_promptconcat_debug_str()
 
     while True:
         # Stop when the requested amount is reached (unless endless mode)
         if not endless_until_cancel and success_count >= target_successes:
             break
+
+        # Ensure prompt placeholders exist for logging even if no prompt was
+        # extracted/generated yet.  This prevents UnboundLocalError when the
+        # pipeline runs in Normal mode (non-PromptConcatenate) because
+        # *pos_prompt* and *neg_prompt* are referenced before they get a
+        # value later in the loop.
+        pos_prompt: str | None = None
+        neg_prompt: str | None = None
 
         # Check if user requested cancellation from the UI
         if CANCEL_REQUESTED:
@@ -619,7 +356,7 @@ def run_pipeline_gui(
             status_str = "Cancelled"
             current_log = "\n\n".join(log_lines)
             pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-            yield None, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
+            yield None, current_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(pending)
             break
 
         attempt += 1
@@ -630,71 +367,19 @@ def run_pipeline_gui(
         log_lines.extend([
             f"========== ATTEMPT {attempt} | Passed {success_count}/{total_target} =========="
         ])
+        
+        # PromptConcat functionality removed
 
-        # ------------------------------------------------------------------
-        # Prepare seed according to the selected mode
-        # ------------------------------------------------------------------
-        def _set_seed(path: str, value: int, node_class: str = "Load Prompt From File - EQX") -> bool:
-            try:
-                data = json.loads(Path(path).read_text())
-                for node in data.values():
-                    if isinstance(node, dict) and node.get("class_type") == node_class:
-                        node.setdefault("inputs", {})["seed"] = int(value)
-                        Path(path).write_text(json.dumps(data, indent=2))
-                        return True
-            except Exception:
-                pass
-            return False
-
-        # Helper: set any *inputs[key]* of a given node id -------------------
-        def _set_input_by_id(path_json: str, node_id: str, key: str, value):
-            """Patch *key* in *node_id* inside workflow JSON located at *path_json*."""
-            try:
-                data_local = json.loads(Path(path_json).read_text())
-                node = data_local.get(node_id)
-                if isinstance(node, dict):
-                    node.setdefault("inputs", {})[key] = value
-                    Path(path_json).write_text(json.dumps(data_local, indent=2))
-                    return True
-            except Exception:
-                pass
-            return False
-
-        current_seed_val: int | None = None
-        if seed_mode.lower().startswith("incre"):
-            # Initialise counter only the first time we use it.
-            if GLOBAL_SEED_COUNTER is None:
-                GLOBAL_SEED_COUNTER = int(seed_counter_input) % (COMFY_MAX_SEED + 1)
-            current_seed_val = GLOBAL_SEED_COUNTER
-            GLOBAL_SEED_COUNTER = (GLOBAL_SEED_COUNTER + 1) % (COMFY_MAX_SEED + 1)
-        elif seed_mode.lower().startswith("rand"):
-            current_seed_val = random.randint(0, COMFY_MAX_SEED)
-        else:  # Fallback to the value typed by the user (static)
-            current_seed_val = min(int(seed_counter_input), COMFY_MAX_SEED)
-
-        # WF1 – Prompt seed --------------------------------------------------------
-        if is_promptconcat:
-            if not _set_input_by_id(wf1_path_mod, "291", "seed", current_seed_val):
-                log_lines.append("[WARN] Could not set PromptConcatUnified seed (node 291)")
-        else:
-            if not _set_seed(wf1_path_mod, current_seed_val):
-                log_lines.append("[WARN] Could not set prompt loader seed (node 190)")
-
-        # WF1 – Image seed via Seed_KSampler_1 (node 189) ---------------------------
-        image_seed_val = random.randint(0, COMFY_MAX_SEED)
-        if not _set_input_by_id(wf1_path_mod, "189", "seed", image_seed_val):
-            log_lines.append("[WARN] Could not set Seed_KSampler_1 seed (node 189)")
-
-        # WF1 – Image seed via Seed_KSampler_2 (node 285) ---------------------------
-        ksampler2_seed_val = random.randint(0, COMFY_MAX_SEED)
-        if not _set_input_by_id(wf1_path_mod, "285", "seed", ksampler2_seed_val):
-            log_lines.append("[WARN] Could not set Seed_KSampler_2 seed (node 285)")
-
-        # WF2 – RandomNoise seeds --------------------------------------------------
-        noise_seed_231 = random.randint(0, COMFY_MAX_SEED)
-        noise_seed_294 = random.randint(0, COMFY_MAX_SEED)
-        _set_input_by_id(wf2_path_mod, "231", "noise_seed", noise_seed_231)
-        _set_input_by_id(wf2_path_mod, "294", "noise_seed", noise_seed_294)
+        # Setup seeds for this attempt using centralized utility
+        seed_values = generate_seeds(seed_mode, seed_counter_input)
+        current_seed_val = seed_values['current_seed']
+        image_seed_val = seed_values['image_seed']
+        ksampler2_seed_val = seed_values['ksampler2_seed']
+        noise_seed_231 = seed_values['noise_seed_231']
+        noise_seed_294 = seed_values['noise_seed_294']
+        
+        # Apply seeds to workflows using centralized utility
+        setup_workflow_seeds(wf1_path_mod, wf2_path_mod, seed_values, log_lines)
 
         # ------------------------------------------------------------------
         # Collect seeds for logging ----------------------------------------
@@ -703,47 +388,27 @@ def run_pipeline_gui(
         if attempt > 1:
             seeds_log_lines.append("")
 
-        # Build structured seed log block ---------------------------------
-        if is_promptconcat:
-            seed_block_gui = [
-                f"Attempt {attempt}:",
-                " WF1:",
-                f"  PromptConcat seed (291): {current_seed_val}",
-                f"  Seed_KSampler_1 (189): {image_seed_val}",
-                f"  Seed_KSampler_2 (285): {ksampler2_seed_val}",
-                " WF2:",
-                f"  noise_seed (231): {noise_seed_231}",
-                f"  noise_seed (294): {noise_seed_294}",
-            ]
-            seed_block_cli = [
-                "[SEED] WF1:",
-                f"[SEED]   PromptConcat seed (291): {current_seed_val}",
-                f"[SEED]   Seed_KSampler_1 (189): {image_seed_val}",
-                f"[SEED]   Seed_KSampler_2 (285): {ksampler2_seed_val}",
-                "[SEED] WF2:",
-                f"[SEED]   noise_seed (231): {noise_seed_231}",
-                f"[SEED]   noise_seed (294): {noise_seed_294}",
-            ]
-        else:
-            seed_block_gui = [
-                f"Attempt {attempt}:",
-                " WF1:",
-                f"  Prompt loader seed (190): {current_seed_val}",
-                f"  Seed_KSampler_1 (189): {image_seed_val}",
-                f"  Seed_KSampler_2 (285): {ksampler2_seed_val}",
-                " WF2:",
-                f"  noise_seed (231): {noise_seed_231}",
-                f"  noise_seed (294): {noise_seed_294}",
-            ]
-            seed_block_cli = [
-                "[SEED] WF1:",
-                f"[SEED]   Prompt loader seed (190): {current_seed_val}",
-                f"[SEED]   Seed_KSampler_1 (189): {image_seed_val}",
-                f"[SEED]   Seed_KSampler_2 (285): {ksampler2_seed_val}",
-                "[SEED] WF2:",
-                f"[SEED]   noise_seed (231): {noise_seed_231}",
-                f"[SEED]   noise_seed (294): {noise_seed_294}",
-            ]
+        # Build structured seed log block with ATTEMPT header
+        total_target = "∞" if endless_until_cancel else target_successes
+        seed_block_gui = [
+            f"========== ATTEMPT {attempt} | Passed {success_count}/{total_target} ==========",
+            "WF1:",
+            f"  Prompt loader seed (190): {current_seed_val}",
+            f"  Seed_KSampler_1 (189): {image_seed_val}",
+            f"  Seed_KSampler_2 (285): {ksampler2_seed_val}",
+            "WF2:",
+            f"  noise_seed (231): {noise_seed_231}",
+            f"  noise_seed (294): {noise_seed_294}",
+        ]
+        seed_block_cli = [
+            "[SEED] WF1:",
+            f"[SEED]   Prompt loader seed (190): {current_seed_val}",
+            f"[SEED]   Seed_KSampler_1 (189): {image_seed_val}",
+            f"[SEED]   Seed_KSampler_2 (285): {ksampler2_seed_val}",
+            "[SEED] WF2:",
+            f"[SEED]   noise_seed (231): {noise_seed_231}",
+            f"[SEED]   noise_seed (294): {noise_seed_294}",
+        ]
 
         # Add seeds to dedicated log pane
         seeds_log_lines.extend(seed_block_gui)
@@ -751,98 +416,27 @@ def run_pipeline_gui(
         # Do not add seed details to main log to avoid duplication
         # log_lines.extend(seed_block_gui)
 
-        # --------------------------------------------------------------
-        # Extract and log positive/negative prompts (WF1) -------------
-        # --------------------------------------------------------------
-        def _extract_prompts_normal(path_json: str, seed_val: int):
-            try:
-                data_local = json.loads(Path(path_json).read_text())
-                node190 = data_local.get("190", {})
-                fpath = node190.get("inputs", {}).get("file_path")
-                if not isinstance(fpath, str) or not Path(fpath).exists():
-                    return None, None
-                lines = Path(fpath).read_text(encoding="utf-8", errors="ignore").splitlines()
-                if not lines:
-                    return None, None
-                idx = seed_val % len(lines)
-                raw = lines[idx].strip()
-                import re as _re
-                m = _re.match(r"\{\{\{[^}]+\}\}\}\{([^}]*)\}\{([^}]*)\}", raw)
-                if not m:
-                    m = _re.match(r"\{\{\{[^}]+\}\}\}\{\{([^}]*)\}\}\{([^}]*)\},?", raw)
-                if m:
-                    return m.group(1).strip(), m.group(2).strip()
-            except Exception:
-                pass
-            return None, None
-
-        pos_prompt: str | None = None
-        neg_prompt: str | None = None
-
-        if not is_promptconcat:
-            pos_prompt, neg_prompt = _extract_prompts_normal(wf1_path_mod, current_seed_val)
+        # Handle prompt generation/extraction based on mode
+        if is_promptconcat:
+            # Parse configurations and inject dynamic prompts for PromptConcatenate
+            file_configs = parse_promptconcat_configs(dynamic_values, num_nsfw_cats, len(WF1_MAPPING), len(WF2_MAPPING))
+            pos_prompt, neg_prompt = inject_dynamic_prompts(wf1_path_mod, file_configs, current_seed_val, attempt)
+            log_lines.extend([f"[PROMPTCONCAT] Generated prompts for attempt {attempt}"])
         else:
-            # Build prompts by emulating node 293 behaviour
-            try:
-                data_pc = json.loads(Path(wf1_path_mod).read_text())
-                node293 = data_pc.get("293", {})
-                inp = node293.get("inputs", {}) if isinstance(node293, dict) else {}
-                base_dir = Path(inp.get("base_dir", ""))
-                pos_join = inp.get("positive_joiner", " ")
-                neg_join = inp.get("negative_joiner", ", ")
+            # Extract prompts for Normal mode using centralized utility
+            pos_prompt, neg_prompt = extract_prompts_normal(wf1_path_mod, current_seed_val)
+            log_lines.extend([f"[NORMAL] Extracted prompts for attempt {attempt}"])
 
-                seed_local = int(inp.get("seed", current_seed_val)) if isinstance(inp.get("seed"), int) else current_seed_val
-
-                def _concat_parts(subdir: str, joiner: str):
-                    """Return concatenated string for *subdir* replicating node 293 logic.
-
-                    The real ComfyUI node selects **one** random line from every
-                    text file inside *base_dir/subdir*.  The random generator is
-                    initialised with the same seed that is fed to the node so
-                    the selection is deterministic for a given seed value.
-
-                    This implementation mirrors that behaviour using
-                    ``random.Random(seed_local)`` so the previews shown in the
-                    GUI match the actual prompts that ComfyUI will build.
-                    """
-
-                    try:
-                        dir_p = base_dir / subdir
-                        parts_files = sorted(dir_p.glob("*.txt"))
-
-                        if not parts_files:
-                            return None
-
-                        import hashlib
-
-                        tokens: list[str] = []
-
-                        for f in parts_files:
-                            lines = [ln.strip() for ln in f.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()]
-                            if not lines:
-                                continue  # skip empty files
-
-                            # Derive per-file sub-seed exactly like the ComfyUI node
-                            digest = hashlib.sha256((f.name + str(seed_local)).encode()).digest()
-                            sub_seed = int.from_bytes(digest[:8], "big")
-                            rng = random.Random(sub_seed)
-
-                            idx = rng.randrange(len(lines))
-                            tokens.append(lines[idx])
-
-                        return joiner.join(tokens) if tokens else None
-                    except Exception:
-                        # Any error -> return None so caller can handle gracefully
-                        return None
-
-                pos_prompt = _concat_parts("positive", pos_join)
-                neg_prompt = _concat_parts("negative", neg_join)
-            except Exception:
-                pos_prompt = neg_prompt = None
-
-        if pos_prompt is not None or neg_prompt is not None:
-            log_lines.append(f"[PROMPT] Positive: {pos_prompt if pos_prompt is not None else '-'}")
-            log_lines.append(f"[PROMPT] Negative: {neg_prompt if neg_prompt is not None else '-'}")
+        # Log prompts to dedicated prompt log (works for both modes)
+        if attempt > 1:
+            prompt_log_lines.append("")
+        
+        total_target = "∞" if endless_until_cancel else target_successes
+        prompt_log_lines.extend([
+            f"========== ATTEMPT {attempt} | Passed {success_count}/{total_target} ==========",
+            f"Positive Prompt: {pos_prompt if pos_prompt is not None else 'No prompt found'}",
+            f"Negative Prompt: {neg_prompt if neg_prompt is not None else 'No prompt found'}",
+        ])
 
         # ------------------------------------------------------------------
         # Run Workflow 1
@@ -854,7 +448,7 @@ def run_pipeline_gui(
         #     the attempt header and seeds immediately ---------------------
         current_log = "\n\n".join(log_lines)
         pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-        yield None, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
+        yield None, current_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(pending)
 
         start_time = time.time()
         try:
@@ -864,7 +458,7 @@ def run_pipeline_gui(
             log_lines.extend([err_msg])
             current_log = "\n\n".join(log_lines)
             pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-            yield None, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
+            yield None, current_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(pending)
             continue
 
         wf1_img_path = oc.newest_file(output_dir, after=start_time)
@@ -873,7 +467,7 @@ def run_pipeline_gui(
             log_lines.extend([err_msg])
             current_log = "\n\n".join(log_lines)
             pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-            yield None, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
+            yield None, current_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(pending)
             continue
 
         wf1_img_pil = _load_img(wf1_img_path)
@@ -883,7 +477,7 @@ def run_pipeline_gui(
         # Show WF1 image immediately
         current_log = "\n\n".join(log_lines)
         pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-        yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
+        yield wf1_img_pil, current_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(pending)
 
         # ----------------------------------------------------------------------
         # Build optional parameters for run_checks according to UI
@@ -898,7 +492,7 @@ def run_pipeline_gui(
         # Yield before running checks so UI reflects status change
         current_log = "\n\n".join(log_lines)
         pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-        yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
+        yield wf1_img_pil, current_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(pending)
         try:
             results = oc.run_checks(
                 wf1_img_path,
@@ -912,7 +506,7 @@ def run_pipeline_gui(
             log_lines.extend([err_msg])
             current_log = "\n\n".join(log_lines)
             pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-            yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
+            yield wf1_img_pil, current_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(pending)
             continue
 
         # Pretty-print results on multiple lines for readability ------------
@@ -922,21 +516,10 @@ def run_pipeline_gui(
 
         current_log = "\n\n".join(log_lines)
         pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-        yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
+        yield wf1_img_pil, current_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(pending)
 
-        # -----------------------------
-        failed = False
-        if results.get("is_nsfw"):
-            failed = True
-            log_lines.extend([f"[CHECK] Image flagged as NSFW. Pipeline stops."])
-
-        if stop_multi_faces and results.get("face_count", 0) > 1:
-            failed = True
-            log_lines.extend([f"[CHECK] More than one face detected and stop option is active."])
-
-        if stop_partial_face and results.get("is_partial_face"):
-            failed = True
-            log_lines.extend([f"[CHECK] Partial face detected and stop option is active."])
+        # Evaluate check results using centralized utility
+        failed = evaluate_check_results(results, stop_multi_faces, stop_partial_face, log_lines)
 
         if failed:
             # Delete the generated file to save disk space
@@ -950,7 +533,7 @@ def run_pipeline_gui(
             GLOBAL_REJECTED_COUNT += 1
             current_log = "\n\n".join(log_lines)
             pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-            yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
+            yield wf1_img_pil, current_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(pending)
             continue
 
         # ----------------------------------------------------------------------
@@ -972,7 +555,7 @@ def run_pipeline_gui(
         status_str = "Generating (WF2)"
         current_log = "\n\n".join(log_lines)
         pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-        yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
+        yield wf1_img_pil, current_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(pending)
         start_time2 = time.time()
         overrides = {oc.LOAD_NODE_ID_WF2: {"image": str(verified_path)}}
         try:
@@ -982,7 +565,7 @@ def run_pipeline_gui(
             log_lines.extend([err_msg])
             current_log = "\n\n".join(log_lines)
             pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-            yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
+            yield wf1_img_pil, current_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(pending)
             continue
 
         wf2_img_path = oc.newest_file(output_dir, after=start_time2)
@@ -991,7 +574,7 @@ def run_pipeline_gui(
             log_lines.extend([err_msg])
             current_log = "\n\n".join(log_lines)
             pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-            yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
+            yield wf1_img_pil, current_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(pending)
             continue
 
         wf2_img_pil = _load_img(wf2_img_path)
@@ -1000,129 +583,23 @@ def run_pipeline_gui(
         # Add the approved final image to the album and display
         album_images.append(wf2_img_pil)
 
-        # NEW: keep gallery size bounded to the last MAX_GALLERY_IMAGES
-        if len(album_images) > MAX_GALLERY_IMAGES:
-            album_images = album_images[-MAX_GALLERY_IMAGES:]
+        # Keep gallery size bounded to the configured maximum
+        if len(album_images) > CONFIG.ui.MAX_GALLERY_IMAGES:
+            album_images = album_images[-CONFIG.ui.MAX_GALLERY_IMAGES:]
 
         status_str = "Completed"
 
         current_log = "\n\n".join(log_lines)
         pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
-        yield wf1_img_pil, current_log, _seeds_log_str(), None, album_images, *_boxes(pending)
+        yield wf1_img_pil, current_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(pending)
 
         # Extract base filename from node 175 (ShowText) for this attempt
-        def _extract_filename_base(wf1_json: str, wf2_json: str) -> str | None:
-            """Build a filename base using several nodes that influence it.
+        # Extract filename base using centralized utility
+        filename_base = extract_filename_base_util(wf1_path_mod, wf2_path_mod, is_promptconcat, pos_prompt, neg_prompt, override_save_name, save_name_base)
+        
+        # Filename base calculation moved to pipeline_utils.py
 
-            Priority order:
-            1. The *filename_prefix* defined in the SaveImage node from Workflow 2.
-               If that field is a link to another node we extract its **text** input.
-            2. The *text_0* value from node **175** (ShowText) of Workflow 1.
-            3. Fallback to None if no text could be gathered.
-
-            When both prefix and the suffix defined in the SaveImage node are
-            available, the result becomes "{prefix}{delimiter}{suffix}".  All
-            characters not safe for filenames are replaced with "_" and the
-            total length is capped to 255 characters.
-            """
-
-            import re
-
-            def _safe(txt: str) -> str:
-                return re.sub(r"[^A-Za-z0-9._-]", "_", txt.strip()) if txt else ""
-
-            # 0. Prefix coming from node 190 (Load Prompt From File)
-
-            prefix: str | None = None
-            try:
-                data_wf1_seed = json.loads(Path(wf1_json).read_text())
-                node190 = data_wf1_seed.get("190", {})
-                if isinstance(node190.get("inputs"), dict):
-                    txt_path = node190["inputs"].get("file_path")
-                    seed_val = node190["inputs"].get("seed")
-                    if isinstance(txt_path, str) and Path(txt_path).exists() and isinstance(seed_val, int):
-                        lines = Path(txt_path).read_text(encoding="utf-8", errors="ignore").splitlines()
-                        if lines:
-                            idx = seed_val % len(lines)
-                            raw_line = lines[idx].strip()
-                            import re as _re
-                            m = _re.match(r"\{\{\{([^}]+)\}\}\}", raw_line)
-                            if m:
-                                prefix = m.group(1)
-            except Exception:
-                pass
-
-            # 2. Fallback to ShowText (175) if no prefix yet
-            if prefix is None:
-                try:
-                    data_wf1_bt = json.loads(Path(wf1_json).read_text())
-                    v175 = data_wf1_bt.get("175", {}).get("inputs", {}).get("text_0")
-                    if isinstance(v175, str) and v175.strip():
-                        prefix = v175.strip()
-                except Exception:
-                    pass
-
-            # 1. Parse Workflow 2 – SaveImage node for suffix / delimiter
-            suffix: str | None = None
-            delim = "_"
-
-            try:
-                data_wf2 = json.loads(Path(wf2_json).read_text())
-                save_node = None
-                for n in data_wf2.values():
-                    if isinstance(n, dict) and isinstance(n.get("class_type"), str):
-                        if n["class_type"].lower().startswith("saveimage"):
-                            save_node = n
-                            break
-
-                if save_node and isinstance(save_node.get("inputs"), dict):
-                    inputs_si = save_node["inputs"]
-
-                    # Delimiter override
-                    if isinstance(inputs_si.get("filename_delimiter"), str):
-                        delim = inputs_si["filename_delimiter"] or "_"
-
-                    # Helper to resolve value or reference
-                    def _resolve(val):
-                        if isinstance(val, str):
-                            return val
-                        if (
-                            isinstance(val, list)
-                            and len(val) >= 1
-                            and isinstance(val[0], (str, int))
-                        ):
-                            ref_id = str(val[0])
-                            ref_node = data_wf2.get(ref_id, {})
-                            if isinstance(ref_node.get("inputs"), dict):
-                                cand = (
-                                    ref_node["inputs"].get("text")
-                                    or ref_node["inputs"].get("text_0")
-                                )
-                                if isinstance(cand, str):
-                                    return cand
-                        return None
-
-                    # We purposefully *ignore* filename_prefix from SaveImage,
-                    # because the user requested using node 190 output instead.
-                    suffix = _resolve(inputs_si.get("filename_suffix")) or None
-            except Exception:
-                pass
-
-            # Decide final base parts --------------------------------------
-            parts = []
-            if prefix and prefix.strip():
-                parts.append(prefix.strip())
-
-            if suffix and suffix.strip():
-                parts.append(suffix.strip())
-
-            if not parts:
-                return None
-
-            filename_base = delim.join(_safe(p) for p in parts if p.strip())
-            return filename_base[:255] if filename_base else None
-
-        default_filename_base = _extract_filename_base(wf1_path_mod, wf2_path_mod)
+        default_filename_base = extract_filename_base_util(wf1_path_mod, wf2_path_mod, is_promptconcat, pos_prompt, neg_prompt, override_save_name, save_name_base)
 
         try:
             if override_save_name and save_name_base.strip():
@@ -1170,13 +647,12 @@ def run_pipeline_gui(
 
         # end loop iteration
 
-    # end of while loop -----------------------------------------------------
     # Send final update so indicators show the correct counts (pending=0)
     sound_placeholder = _get_notification_sound() if play_sound else None
 
     final_pending = 0
     final_log = "\n\n".join(log_lines)
-    yield None, final_log, _seeds_log_str(), None, album_images, *_boxes(final_pending)
+    yield None, final_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(final_pending)
 
     # (global mappings are updated during GUI construction; do not reassign
     # them here to avoid Python's local-variable shadowing.)
@@ -1189,337 +665,87 @@ def run_pipeline_gui(
 # -----------------------------------------------------------------------------
 
 def launch_gui():
-    with gr.Blocks(css=CSS) as demo:
+    with gr.Blocks(css=CSS_STYLES) as demo:
         gr.Markdown("# WorkflowUI")
 
-        # -------------------- Preset section at top ----------------------
-        with gr.Accordion("Configuration Presets", open=False):
-            gr.Markdown("")
+        # -------------------- Preset section (modularized) ----------------------
+        preset_components = create_preset_section()
+        (filter_txt, presets_dd, preset_name_txt, save_preset_btn,
+         load_preset_btn, delete_preset_btn, export_btn, reset_btn,
+         rename_txt, rename_btn, import_file) = preset_components
 
-            # -------- Two-column layout ---------------------------------
-            with gr.Row():
-                # ===== LEFT: list & filter =====
-                with gr.Column(scale=1):
-                    filter_txt = gr.Textbox(
-                        label="Search presets", 
-                        placeholder="Type to filter by name", 
-                        interactive=True,
-                    )
+        # Helper functions now imported from ui_callbacks
 
-                    # Always-visible list of presets
-                    presets_dd = gr.Radio(
-                        label="Available presets",
-                        choices=[p.stem for p in PRESET_DIR.glob("*.json")],
-                        interactive=True,
-                        info="Select a preset to load, rename, delete or export",
-                    )
+        # --- Filter button updates both selectors --------------------
+        filter_txt.change(
+            lambda txt: gr.update(choices=filter_presets(txt), value=None),
+            inputs=[filter_txt],
+            outputs=[presets_dd],
+        )
 
-                # ===== RIGHT: create / rename / import =====
-                with gr.Column(scale=1):
-                    preset_name_txt = gr.Textbox(
-                        label="Preset name",
-                        placeholder="MyNewPreset",
-                        info="Create a new preset or overwrite an existing one",
-                    )
-                    save_preset_btn = gr.Button("Save / Overwrite")
-                    with gr.Row():
-                        load_preset_btn = gr.Button("Load")
-                        delete_preset_btn = gr.Button("Delete")
-                        export_btn = gr.Button("Export")
-                        reset_btn = gr.Button("Reset defaults")
+        # --- Sync list->dropdown so existing callbacks keep working ---
+        presets_dd.change(lambda x: x, inputs=[presets_dd], outputs=[presets_dd])
 
-                    rename_txt = gr.Textbox(label="Rename to", placeholder="New name")
-                    rename_btn = gr.Button("Rename")
-                    gr.Markdown("**Import preset (.json)**")
-                    import_file = gr.File(
-                        label="Import file",
-                        file_types=[".json"],
-                        interactive=True,
-                    )
+        # --- Delete preset -------------------------------------------
+        delete_preset_btn.click(
+            lambda sel: update_preset_selector(None) if (delete_preset_wrapper(sel) or True) else gr.update(),
+            inputs=[presets_dd],
+            outputs=[presets_dd],
+        )
 
-            # Helper functions ----------------------------------
-            def _list_presets():
-                return sorted([p.stem for p in PRESET_DIR.glob("*.json")])
+        # --- Rename preset -------------------------------------------
+        rename_btn.click(
+            lambda old, new: update_preset_selector(new) if (rename_preset(old, new) or True) else gr.update(),
+            inputs=[presets_dd, rename_txt],
+            outputs=[presets_dd],
+        )
 
-            def _filter_presets(pattern: str):
-                pattern = (pattern or "").lower().strip()
-                names = _list_presets()
-                if not pattern:
-                    return names
-                return [n for n in names if pattern in n.lower()]
+        # --- Export preset (unchanged, uses current selection) -------
+        export_btn.click(export_preset, inputs=[presets_dd], outputs=[import_file])
 
-            def _save_preset(*vals):
-                *cfg_vals, preset_name = vals
-                preset_name = preset_name.strip()
-                if not preset_name:
-                    return gr.update()
-                path = PRESET_DIR / f"{preset_name}.json"
-                with open(path, "w") as f:
-                    json.dump(cfg_vals, f)
-                choices = [p.stem for p in PRESET_DIR.glob("*.json")]
-                return gr.update(choices=choices, value=preset_name)
+        # --- Import preset (returns update objects) ------------------
+        import_file.upload(
+            lambda f: update_preset_selector(None) if (import_preset(f) or True) else gr.update(),
+            inputs=[import_file],
+            outputs=[presets_dd],
+        )
 
-            def _load_preset(selected_name):
-                if not selected_name:
-                    return DEFAULT_VALUES
-                path = PRESET_DIR / f"{selected_name}.json"
-                if not path.exists():
-                    return DEFAULT_VALUES
-                try:
-                    cfg_vals = json.loads(path.read_text())
-                    if len(cfg_vals) != len(ALL_COMPONENTS):
-                        return DEFAULT_VALUES
-                    return cfg_vals
-                except Exception:
-                    return DEFAULT_VALUES
-
-            def _delete_preset(name):
-                if not name:
-                    return gr.update()
-                path = PRESET_DIR / f"{name}.json"
-                if path.exists():
-                    path.unlink()
-                return gr.update(choices=_list_presets(), value=None)
-
-            def _rename_preset(old_name, new_name):
-                new_name = (new_name or "").strip()
-                if not old_name or not new_name:
-                    return gr.update()
-                src = PRESET_DIR / f"{old_name}.json"
-                dst = PRESET_DIR / f"{new_name}.json"
-                if src.exists():
-                    src.rename(dst)
-                return gr.update(choices=_list_presets(), value=new_name)
-
-            def _export_preset(name):
-                if not name:
-                    return None
-                return PRESET_DIR / f"{name}.json"
-
-            def _import_preset(file_obj):
-                if file_obj is None:
-                    return gr.update()
-                try:
-                    dst = PRESET_DIR / Path(file_obj.name).name
-                    shutil.copy(file_obj.name, dst)
-                except Exception:
-                    pass
-                return gr.update(choices=_list_presets(), value=dst.stem)
-
-            # --- Helper to return an update for the selector component ----
-            def _update_selector(selected: str | None):
-                return gr.update(choices=_list_presets(), value=selected)
-
-            # --- Filter button updates both selectors --------------------
-            filter_txt.change(
-                lambda txt: gr.update(choices=_filter_presets(txt), value=None),
-                inputs=[filter_txt],
-                outputs=[presets_dd],
-            )
-
-            # --- Sync list->dropdown so existing callbacks keep working ---
-            presets_dd.change(lambda x: x, inputs=[presets_dd], outputs=[presets_dd])
-
-            # --- Delete preset -------------------------------------------
-            delete_preset_btn.click(
-                lambda sel: _update_selector(None) if (_delete_preset(sel) or True) else gr.update(),
-                inputs=[presets_dd],
-                outputs=[presets_dd],
-            )
-
-            # --- Rename preset -------------------------------------------
-            rename_btn.click(
-                lambda old, new: _update_selector(new) if (_rename_preset(old, new) or True) else gr.update(),
-                inputs=[presets_dd, rename_txt],
-                outputs=[presets_dd],
-            )
-
-            # --- Export preset (unchanged, uses current selection) -------
-            export_btn.click(_export_preset, inputs=[presets_dd], outputs=[import_file])
-
-            # --- Import preset (returns update objects) ------------------
-            import_file.upload(
-                lambda f: _update_selector(None) if (_import_preset(f) or True) else gr.update(),
-                inputs=[import_file],
-                outputs=[presets_dd],
-            )
-
-        run_btn = gr.Button("Run Pipeline", variant="primary")
-        cancel_btn = gr.Button("Cancel", variant="stop")
-        with gr.Row():
-            pending_box = gr.Markdown("Pending: 0", elem_id="pending-box", elem_classes=["pending-box"])
-            status_box = gr.Markdown("Idle", elem_id="status-box", elem_classes=["pending-box"])
-            metrics_box = gr.Markdown("Approved: 0 | Rejected: 0", elem_id="metrics-box", elem_classes=["pending-box"])
+        # Main controls and status (modularized)
+        batch_runs_input, run_btn, cancel_btn, endless_until_cancel_cb, play_sound_cb = create_main_controls_section()
+        pending_box, status_box, metrics_box = create_status_boxes_section()
 
         with gr.Row():
             with gr.Column(scale=1):
-                output_dir_input = gr.Textbox(label="ComfyUI Output Folder", value=str(DEFAULT_OUTPUT_DIR))
-                final_dir_input = gr.Textbox(label="Destination Folder for Final Images", value=str((Path.home()/"ComfyUI"/"final").expanduser()))
+                output_dir_input, final_dir_input = create_directory_section()
 
-                with gr.Accordion("Checks to Perform", open=False):
-                    do_nsfw_cb = gr.Checkbox(label="Detect NSFW", value=True)
+                checks_components = create_advanced_checks_section()
+                (do_nsfw_cb, do_face_count_cb, do_partial_face_cb, nsfw_cat_checkboxes,
+                 nsfw_cat_group, stop_multi_faces_cb, stop_partial_face_cb,
+                 confidence_slider, margin_slider) = checks_components
 
-                    with gr.Accordion("Select NSFW Categories to Detect", open=False) as nsfw_cat_group:
-                        nsfw_cat_checkboxes = []
-                        for internal, display in sorted(CATEGORY_DISPLAY_MAPPINGS.items()):
-                            if internal == "NOT_DETECTED":
-                                continue
-                            nsfw_cat_checkboxes.append(
-                                gr.Checkbox(label=display, value=(internal in DEFAULT_NSFW_CATEGORIES))
-                            )
+                # Seed settings (modularized)
+                seed_mode_radio, seed_counter_input = create_seed_settings_section()
 
-                    # Hide/show category selection depending on NSFW toggle
-                    do_nsfw_cb.change(lambda x: gr.update(visible=x), do_nsfw_cb, nsfw_cat_group)
-
-                    do_face_count_cb = gr.Checkbox(label="Count Faces", value=True)
-                    do_partial_face_cb = gr.Checkbox(label="Detect Partial Face", value=True)
-
-                    # Opciones avanzadas de detención
-                    with gr.Accordion("Criteria to STOP the pipeline", open=False):
-                        stop_multi_faces_cb = gr.Checkbox(
-                            label="Stop if more than one face is detected", value=False
-                        )
-                        stop_partial_face_cb = gr.Checkbox(
-                            label="Stop if face is partially visible", value=False
-                        )
-
-                    confidence_slider = gr.Slider(
-                        0.1,
-                        1.0,
-                        0.8,
-                        step=0.05,
-                        label="Face detection confidence",
-                        info="Higher requires stronger face match to pass (0.1-1.0)"
-                    )
-
-                    margin_slider = gr.Slider(
-                        0.0,
-                        2.0,
-                        0.5,
-                        step=0.1,
-                        label="Partial face margin",
-                        info="How much extra margin around face is allowed before considered partial"
-                    )
-
-                    # End of Checks accordion
-
-                # --------------------------------------------------
-                # Execution settings (batch + seed) – outside Checks accordion
-                # --------------------------------------------------
-                with gr.Accordion("Execution Settings", open=False):
-                    with gr.Row():
-                        with gr.Column():
-                            batch_runs_input = gr.Number(
-                                value=1,
-                                minimum=1,
-                                precision=0,
-                                label="Batch Runs",
-                                info="Number of successful final images to generate when not in endless mode"
-                            )
-
-                            endless_until_cancel_cb = gr.Checkbox(
-                                label="Endless until cancel", value=False
-                            )
-
-                            play_sound_cb = gr.Checkbox(
-                                label="Play sound when batch completes", value=True,
-                            )
-
-                        with gr.Column():
-                            seed_mode_radio = gr.Radio(
-                                choices=["Incremental", "Random", "Static"],
-                                value="Incremental",
-                                label="Seed mode",
-                            )
-                            seed_counter_input = gr.Number(
-                                value=0,
-                                minimum=0,
-                                maximum=MAX_SEED_VALUE,
-                                precision=0,
-                                label="Initial/Current Seed (<= 18446744073709551615)",
-                                info="Starting seed for Incremental mode or static seed if using Static mode"
-                            )
-
-                    # NEW: Settings Override ---------------------------------------------------
-                    # Settings Override moved to a dedicated full-width section below.
-                    # Variables declared here so they exist before later usage.
-                    override_components: list = []
-                    WF1_OVERRIDE_MAPPING: list[tuple[str, str, type]] = []
-                    override_components2: list = []
-                    WF2_OVERRIDE_MAPPING: list[tuple[str, str, type]] = []
-
-                    # ----------------------------------------------------------------
-                    # Additional execution overrides (kept inside Execution Settings)
-                    # ----------------------------------------------------------------
-
-                    # Custom filename ---------------------------------------------------
-                    with gr.Accordion("Custom final filename", open=False):
-                        override_filename_cb = gr.Checkbox(label="Override final filename", value=False)
-                        filename_text = gr.Textbox(label="Base filename", value="final_image")
-
-                    # Node 171 – Characteristics text override ---------------------------
-                    characteristics_text = gr.Textbox(
-                        label="Replace this with the characteristics of each girl",
-                        lines=3,
-                        value="A photo of GeegeeDwa1 posing next to a white chair. She has long darkbrown hair styled in pigtails and very pale skin. She wears a vibrant sexy outfit. Her expression is a smirk. The background shows a modern apartment that exudes a candid atmosphere.",
-                    )
-
-                    # Direct Prompt Loader ----------------------------------------------
-                    with gr.Accordion("Load Prompt list Manually", open=False):
-                        load_prompts_cb = gr.Checkbox(label="Enable direct prompt list", value=False)
-                        prompts_textbox = gr.Textbox(
-                            label="Prompt list (format: {{{id}}}{{positive}}{negative}, …)",
-                            lines=4,
-                            placeholder="{{{title}}}{{positive}}{negative}, …",
-                            visible=False,
-                        )
-
-                        # Toggle visibility of the prompt textbox
-                        load_prompts_cb.change(lambda x: gr.update(visible=x), inputs=[load_prompts_cb], outputs=[prompts_textbox])
+                # Output & prompts (modularized)
+                output_components = create_output_prompts_section()
+                (override_filename_cb, filename_text, characteristics_text,
+                 load_prompts_cb, prompts_textbox) = output_components
 
                 pass  # directory inputs finished
 
-                # Log textbox (below all accordions)
-                log_text = gr.Textbox(label="Log", lines=18, interactive=False)
-                seeds_log_text = gr.Textbox(label="Seeds Log", lines=8, interactive=False)
+            # Middle column: Images and Gallery (modularized)
+            with gr.Column(scale=2):
+                wf1_img_out, album_gallery, sound_audio = create_images_gallery_section()
 
-            with gr.Column(scale=3):
-                # First row: both workflow images side by side
-                with gr.Row(equal_height=True):
-                    wf1_img_out = gr.Image(
-                        label="Workflow 1 Image",
-                        interactive=False,
-                        height=400,
-                        elem_classes=["preview-img"],
-                    )
-                    wf2_img_out = gr.Image(
-                        label="Workflow 2 Image",
-                        interactive=False,
-                        height=400,
-                        elem_classes=["preview-img"],
-                    )
-
-                # Second row: gallery only
-                with gr.Row():
-                    try:
-                        from gradio.components import Carousel  # Gradio >=4
-                        album_gallery = Carousel(
-                            label="Results (last 20)",
-                            visible=True,
-                            scale=2,
-                        )
-                    except ImportError:
-                        album_gallery = gr.Gallery(
-                            label="Results (last 20)",
-                            columns=[4],
-                            preview=False,
-                            elem_id="results-gallery",
-                            scale=2,
-                        )
-
-                    sound_audio = gr.Audio(label="Sound", autoplay=True, visible=False)
+            # Right column: Logs (modularized)
+            with gr.Column(scale=1):
+                log_text, seeds_log_text, prompt_log_text = create_logs_section()
 
         # Dynamic workflow editors ------------------------------------------------
+
+        # Initialize override mappings before use
+        WF1_OVERRIDE_MAPPING = []
+        WF2_OVERRIDE_MAPPING = []
 
         # Workflow editors removed; keep mapping lists for override only
         global WF1_MAPPING, WF2_MAPPING
@@ -1529,11 +755,9 @@ def launch_gui():
         WF2_MAPPING = globals().get("WF2_OVERRIDE_MAPPING", [])
 
         # ---------------- Settings Override (Full Width) ----------------
-        with gr.Accordion("Settings Override", open=False):
+        with gr.Accordion("🔧 Advanced Workflow Settings", open=False):
             override_components = []
             override_components2 = []
-            WF1_OVERRIDE_MAPPING = []
-            WF2_OVERRIDE_MAPPING = []
 
             # Helpers -------------------------------------------------
             try:
@@ -1546,169 +770,119 @@ def launch_gui():
             except Exception:
                 wf2_data = {}
 
-            def _def_val(node: dict | None, key: str, fallback: Any = None):
-                if node and isinstance(node, dict):
-                    return node.get("inputs", {}).get(key, fallback)
-                return fallback
-
-            def _num(label: str, value: int | float | None = None):
-                return gr.Number(label=label, value=value if value is not None else 0, precision=0)
+            # Using centralized utility functions
+            _def_val = get_default_node_value
 
             # Layout: two columns side by side -----------------------
             with gr.Row():
                 # ---------------- LEFT: Workflow 1 -----------------
                 with gr.Column(scale=1):
-                    # Toggle between Normal and PromptConcat variants -------------------
+                    # Workflow 1 Mode -------------------
                     wf1_mode_radio = gr.Radio(
-                        choices=["Normal", "PromptConcat"],
+                        choices=["Normal", "PromptConcatenate"],
                         value="Normal",
                         label="Workflow 1 Mode",
                     )
 
-                    gr.Markdown("### Workflow 1 Overrides")
+                    gr.Markdown("### Workflow 1")
 
                     # 168 – Steps KSampler 1
                     n168 = wf1_data.get("168", {})
-                    comp_168 = _num("Steps KSampler 1 - 168", _def_val(n168, "steps", 20))
+                    comp_168 = create_number_input("Steps KSampler 1", _def_val(n168, "steps", 20))
                     override_components.append(comp_168)
                     WF1_OVERRIDE_MAPPING.append(("168", "steps", int))
 
                     # 169 – Steps KSampler 2
                     n169 = wf1_data.get("169", {})
-                    comp_169 = _num("Steps KSampler 2 - 169", _def_val(n169, "steps", 20))
+                    comp_169 = create_number_input("Steps KSampler 2", _def_val(n169, "steps", 60))
                     override_components.append(comp_169)
                     WF1_OVERRIDE_MAPPING.append(("169", "steps", int))
 
                     # 170 – Prefix Title Text
                     n170 = wf1_data.get("170", {})
-                    comp_170 = gr.Textbox(label="Prefix Title Text - 170", value=_def_val(n170, "text", ""))
+                    comp_170 = gr.Textbox(label="Prefix Title", value=_def_val(n170, "text", "GirlName"))
                     override_components.append(comp_170)
                     WF1_OVERRIDE_MAPPING.append(("170", "text", str))
 
                     # 173 – Checkpoint
                     n173 = wf1_data.get("173", {})
-                    comp_173 = gr.Textbox(label="Checkpoint - 173", value=_def_val(n173, "ckpt_name", ""))
+                    comp_173 = gr.Textbox(label="Checkpoint", value=_def_val(n173, "ckpt_name", ""))
                     override_components.append(comp_173)
                     WF1_OVERRIDE_MAPPING.append(("173", "ckpt_name", str))
 
                     # 176 – Width & Height
-                    gr.Markdown("**Width & Height - 176**")
+                    gr.Markdown("**Resolution**")
                     with gr.Row():
-                        comp_176_w = _num("Width", _def_val(n176 := wf1_data.get("176", {}), "width", 512))
-                        comp_176_h = _num("Height", _def_val(n176, "height", 512))
+                        comp_176_w = create_number_input("Width", _def_val(n176 := wf1_data.get("176", {}), "width", 512))
+                        comp_176_h = create_number_input("Height", _def_val(n176, "height", 512))
                     override_components.extend([comp_176_w, comp_176_h])
                     WF1_OVERRIDE_MAPPING.extend([
                         ("176", "width", int),
                         ("176", "height", int),
                     ])
 
-                    # --- Visibility toggle for PromptConcat-specific fields --------
-                    def _toggle_pc_fields(mode: str):
-                        vis = (mode == "PromptConcat")
-                        # Return updates for the three PromptConcat fields
-                        return (
-                            gr.update(visible=vis),
-                            gr.update(visible=vis),
-                            gr.update(visible=vis),
-                        )
-
-                    # The actual registration will occur after we create the PromptConcat components below
-
-                    # 180 – Text 180
+                    # 180 – Face Prompt Node
                     n180 = wf1_data.get("180", {})
-                    comp_180 = gr.Textbox(label="Text - 180", value=_def_val(n180, "text", ""))
+                    comp_180 = gr.Textbox(label="Face Prompt Node", value=_def_val(n180, "text", ""))
                     override_components.append(comp_180)
                     WF1_OVERRIDE_MAPPING.append(("180", "text", str))
 
                     # 182 – Steps KSampler 3
                     n182 = wf1_data.get("182", {})
-                    comp_182 = _num("Steps KSampler 3 - 182", _def_val(n182, "steps", 20))
+                    comp_182 = create_number_input("Steps KSampler 3", _def_val(n182, "steps", 20))
                     override_components.append(comp_182)
                     WF1_OVERRIDE_MAPPING.append(("182", "steps", int))
 
                     # 190 – File Path (Load Prompt From File)
                     n190 = wf1_data.get("190", {})
+                    _f_raw = _def_val(n190, "file_path", "stand1.txt")
+                    from pathlib import Path as _Pth
+                    _f_default = _Pth(_f_raw).name if isinstance(_f_raw, str) else "stand1.txt"
                     comp_190 = gr.Textbox(
                         label="File Path - 190 (relative to texts/)",
-                        value=_def_val(n190, "file_path", ""),
+                        value=_f_default,
                         placeholder="my_prompts.txt",
                         info="Only Filename"
                     )
                     override_components.append(comp_190)
                     WF1_OVERRIDE_MAPPING.append(("190", "file_path", str))
 
-                    # 293 – PromptConcat parameters (only used in PromptConcat variant)
-                    try:
-                        wf1_pc_data = json.loads(Path(oc.WORKFLOW1_PROMPTCONCAT_JSON).read_text())
-                    except Exception:
-                        wf1_pc_data = {}
 
-                    n293_pc = wf1_pc_data.get("293", {})
-                    comp_293_base = gr.Textbox(
-                        label="Base Dir - 293",
-                        value=_def_val(n293_pc, "base_dir", ""),
-                        visible=False,
-                    )
-                    comp_293_pos = gr.Textbox(
-                        label="Positive Joiner - 293",
-                        value=_def_val(n293_pc, "positive_joiner", " "),
-                        visible=False,
-                    )
-                    comp_293_neg = gr.Textbox(
-                        label="Negative Joiner - 293",
-                        value=_def_val(n293_pc, "negative_joiner", ", "),
-                        visible=False,
-                    )
-
-                    override_components.extend([comp_293_base, comp_293_pos, comp_293_neg])
-                    WF1_OVERRIDE_MAPPING.extend([
-                        ("293", "base_dir", str),
-                        ("293", "positive_joiner", str),
-                        ("293", "negative_joiner", str),
-                    ])
-
-                    # Register the visibility callback now that the components exist
-                    wf1_mode_radio.change(
-                        _toggle_pc_fields,
-                        inputs=[wf1_mode_radio],
-                        outputs=[comp_293_base, comp_293_pos, comp_293_neg],
-                    )
 
                 # ---------------- RIGHT: Workflow 2 ----------------
                 with gr.Column(scale=1):
-                    gr.Markdown("### Workflow 2 Overrides")
+                    gr.Markdown("### Workflow 2")
 
-                    def _num2(label: str, value: int | float | None = None):
-                        return gr.Number(label=label, value=value if value is not None else 0)
+                    # Using centralized utility function for numbers
 
-                    # 248 – Text 248
+                    # 248 – Suffix Final File Name - 248
                     n248 = wf2_data.get("248", {})
-                    comp_248 = gr.Textbox(label="Text – 248", value=_def_val(n248, "text", ""))
+                    comp_248 = gr.Textbox(label="Suffix Final File Name - 248", value=_def_val(n248, "text", "SUFFIX"))
                     override_components2.append(comp_248)
                     WF2_OVERRIDE_MAPPING.append(("248", "text", str))
 
                     # 224 – Guidance
                     n224 = wf2_data.get("224", {})
-                    comp_224 = _num2("Guidance", _def_val(n224, "guidance", 7.0))
+                    comp_224 = create_number_input("Guidance", _def_val(n224, "guidance", 7.0), precision=1)
                     override_components2.append(comp_224)
                     WF2_OVERRIDE_MAPPING.append(("224", "guidance", float))
 
                     # 226 – Grain power
                     n226 = wf2_data.get("226", {})
-                    comp_226 = _num2("Grain power", _def_val(n226, "grain_power", 1.0))
+                    comp_226 = create_number_input("Grain power", _def_val(n226, "grain_power", 1.0), precision=1)
                     override_components2.append(comp_226)
                     WF2_OVERRIDE_MAPPING.append(("226", "grain_power", float))
 
                     # 230 – Max Size
                     n230 = wf2_data.get("230", {})
-                    comp_230 = _num2("Max Size", _def_val(n230, "size", 1024))
+                    comp_230 = create_number_input("Max Size", _def_val(n230, "size", 1024))
                     override_components2.append(comp_230)
                     WF2_OVERRIDE_MAPPING.append(("230", "size", int))
 
                     # 239 – Steps & Denoise
                     n239 = wf2_data.get("239", {})
-                    comp_239_steps = _num2("Steps – 239", _def_val(n239, "steps", 20))
-                    comp_239_denoise = _num2("Denoise – 239", _def_val(n239, "denoise", 0.2))
+                    comp_239_steps = create_number_input("Steps – 239", _def_val(n239, "steps", 20))
+                    comp_239_denoise = create_number_input("Denoise – 239", _def_val(n239, "denoise", 0.75), precision=1)
                     override_components2.extend([comp_239_steps, comp_239_denoise])
                     WF2_OVERRIDE_MAPPING.extend([
                         ("239", "steps", int),
@@ -1729,26 +903,26 @@ def launch_gui():
 
                     # 287 – Guidance 287
                     n287 = wf2_data.get("287", {})
-                    comp_287 = _num2("Guidance – 287", _def_val(n287, "guidance", 7.0))
+                    comp_287 = create_number_input("Guidance – 287", _def_val(n287, "guidance", 7.0), precision=1)
                     override_components2.append(comp_287)
                     WF2_OVERRIDE_MAPPING.append(("287", "guidance", float))
 
                     # 289 – Grain power 289
                     n289 = wf2_data.get("289", {})
-                    comp_289 = _num2("Grain power – 289", _def_val(n289, "grain_power", 1.0))
+                    comp_289 = create_number_input("Grain power – 289", _def_val(n289, "grain_power", 1.0), precision=1)
                     override_components2.append(comp_289)
                     WF2_OVERRIDE_MAPPING.append(("289", "grain_power", float))
 
                     # 293 – Max size 293
                     n293 = wf2_data.get("293", {})
-                    comp_293 = _num2("Max size - 293", _def_val(n293, "size", 1024))
+                    comp_293 = create_number_input("Max size - 293", _def_val(n293, "size", 1024))
                     override_components2.append(comp_293)
                     WF2_OVERRIDE_MAPPING.append(("293", "size", int))
 
                     # 302 – Steps & Denoise 302
                     n302 = wf2_data.get("302", {})
-                    comp_302_steps = _num2("Steps – 302", _def_val(n302, "steps", 20))
-                    comp_302_denoise = _num2("Denoise – 302", _def_val(n302, "denoise", 0.2))
+                    comp_302_steps = create_number_input("Steps – 302", _def_val(n302, "steps", 20))
+                    comp_302_denoise = create_number_input("Denoise – 302", _def_val(n302, "denoise", 0.75), precision=1)
                     override_components2.extend([comp_302_steps, comp_302_denoise])
                     WF2_OVERRIDE_MAPPING.extend([
                         ("302", "steps", int),
@@ -1779,101 +953,293 @@ def launch_gui():
             })
 
         # ---------------- LoRA OVERRIDES ----------------
-        with gr.Accordion("LoRA Overrides (nodes 244 & 307)", open=False):
-            # Info note for users about default behaviour when fields are left blank
-            gr.Markdown("**Note:** If these fields are left blank, the default LoRAs defined in the workflow will be used.")
-            # Option to auto-fill LoRAs -------------------------------------------------
-            with gr.Accordion("Auto-fill LoRAs from directory", open=False):
+        with gr.Accordion("🎨 LoRA Configuration", open=False):
+            gr.Markdown("*Leave blank to use workflow defaults*")
+            
+            with gr.Accordion("Auto-fill from directory", open=False):
                 auto_lora_cb = gr.Checkbox(label="Enable auto-fill", value=False)
-                lora_dir_tb = gr.Textbox(label="LoRA directory (absolute path)", placeholder="/abs/path/to/your/lora_dir")
-                populate_btn = gr.Button("Auto Select LORAs")
+                lora_dir_tb = gr.Textbox(label="LoRA directory", placeholder="/path/to/lora/folder")
+                populate_btn = gr.Button("Auto Select")
             with gr.Row():
                 # Node 244 --------------------------------------------------
                 with gr.Column(scale=1):
-                    gr.Markdown("### Node 244 – LoRA list")
+                    gr.Markdown("### Node 244")
                     lora244_inputs = []
                     lora244_strengths = []
                     for idx in range(1, 7):
                         with gr.Row():
-                            txt = gr.Textbox(label=f"lora_{idx} path", placeholder="KimberlyMc1.safetensors")
+                            txt = gr.Textbox(label=f"LoRA {idx}", placeholder="KimberlyMc1.safetensors")
                             default_strength = 0.7 if idx == 1 else 0.3
-                            sl = gr.Slider(0.0, 1.5, default_strength, step=0.05, label="strength")
+                            sl = gr.Slider(0.0, 1.5, default_strength, step=0.05, label="str")
                         lora244_inputs.append(txt)
                         lora244_strengths.append(sl)
 
                 # Node 307 --------------------------------------------------
                 with gr.Column(scale=1):
-                    gr.Markdown("### Node 307 – LoRA list")
+                    gr.Markdown("### Node 307")
                     lora307_inputs = []
                     lora307_strengths = []
                     for idx in range(1, 7):
                         with gr.Row():
-                            txt = gr.Textbox(label=f"lora_{idx} path", placeholder="KimberlyMc1.safetensors")
+                            txt = gr.Textbox(label=f"LoRA {idx}", placeholder="KimberlyMc1.safetensors")
                             default_strength = 0.7 if idx == 1 else 0.3
-                            sl = gr.Slider(0.0, 1.5, default_strength, step=0.05, label="strength")
+                            sl = gr.Slider(0.0, 1.5, default_strength, step=0.05, label="str")
                         lora307_inputs.append(txt)
                         lora307_strengths.append(sl)
 
-            # Callback to populate LoRA paths ------------------------------------
-            def _populate_lora_slots(dir_path: str, *_):
-                """Return updates for the 12 LoRA path textboxes using files from *dir_path*."""
-                from pathlib import Path as _P
-                import random as _rnd
-                if not dir_path:
-                    return [gr.update() for _ in range(12)]
-
-                try:
-                    base = _P(dir_path).expanduser().resolve()
-                    if not base.is_dir():
-                        raise FileNotFoundError
-
-                    files = sorted(base.rglob("*.safetensors"))
-                    if not files:
-                        raise FileNotFoundError
-
-                    flux = None
-                    for p in files:
-                        if p.name.lower() == "flux_realism_lora.safetensors":
-                            flux = p
-                            break
-
-                    def _rel(p: _P):
-                        try:
-                            return str(p.relative_to(base))
-                        except ValueError:
-                            return p.name
-
-                    # Prepare selection pool without flux
-                    pool = [p for p in files if (flux is None or p.resolve() != flux.resolve()) and "flux_realism_lora" not in p.name.lower()]
-                    _rnd.shuffle(pool)
-                    sel = pool[:10]
-
-                    # Build list of 12 values (6 for 244, 6 for 307)
-                    values = [""] * 12
-                    if flux:
-                        values[0] = _rel(flux)
-                        values[6] = _rel(flux)
-
-                    # Fill positions 1-5 and 7-11
-                    for i in range(5):
-                        if i < len(sel):
-                            values[i+1] = _rel(sel[i])
-                    for i in range(5):
-                        idx = i + 5
-                        if idx < len(sel):
-                            values[i+7] = _rel(sel[idx])
-
-                    return [gr.update(value=v) for v in values]
-                except Exception:
-                    # On error, leave unchanged
-                    return [gr.update() for _ in range(12)]
+            # LoRA population callback now imported from ui_callbacks
 
             # Wire button ---------------------------------------------------------
             populate_btn.click(
-                _populate_lora_slots,
+                populate_lora_slots,
                 inputs=[lora_dir_tb],
                 outputs=[*lora244_inputs, *lora307_inputs],
             )
+
+        # ---------------- PromptConcatenate Configuration ----------------
+        with gr.Accordion("🎯 PromptConcatenate Setup", open=False) as promptconcat_accordion:
+            gr.Markdown("**Configure how each prompt file is selected**")
+            
+            # Build the file list dynamically from txt/ directory
+            txt_base_dir = Path(__file__).resolve().parent / "txt"
+            promptconcat_components = []
+            
+            if txt_base_dir.exists():
+                # Organize files by directory
+                positive_files = []
+                negative_files = []
+                
+                for subdir in ["positive", "negative"]:
+                    subdir_path = txt_base_dir / subdir
+                    if subdir_path.exists():
+                        files = sorted(subdir_path.glob("*.txt"))
+                        if subdir == "positive":
+                            positive_files = [f.name for f in files]
+                        else:
+                            negative_files = [f.name for f in files]
+                
+                # Two-column layout
+                with gr.Row():
+                    # Left column: Positive files
+                    with gr.Column(scale=1):
+                        gr.Markdown("### ➕ Positive")
+                        for filename in positive_files:
+                            with gr.Group():
+                                gr.Markdown(f"**{filename}**")
+                                
+                                mode_radio = gr.Radio(
+                                    choices=["default", "fixed", "incremental", "randomized", "index"],
+                                    value="default",
+                                    label="Mode",
+                                    info="default: seed-based | fixed: specific line | incremental: cycle | randomized: random | index: from testing"
+                                )
+                                
+                                fixed_index = gr.Number(
+                                    value=0, minimum=0, precision=0,
+                                    label="Index",
+                                    info="Line number (0-based)",
+                                    visible=False
+                                )
+                                
+                                # Show/hide index field based on mode selection
+                                def make_toggle_fixed_index(fixed_comp):
+                                    def toggle_fixed_index(mode):
+                                        return gr.update(visible=(mode in ["fixed", "index"]))
+                                    return toggle_fixed_index
+                                
+                                mode_radio.change(
+                                    make_toggle_fixed_index(fixed_index),
+                                    inputs=[mode_radio],
+                                    outputs=[fixed_index]
+                                )
+                                
+                                promptconcat_components.extend([mode_radio, fixed_index])
+                    
+                    # Right column: Negative files
+                    with gr.Column(scale=1):
+                        gr.Markdown("### ➖ Negative")
+                        for filename in negative_files:
+                            with gr.Group():
+                                gr.Markdown(f"**{filename}**")
+                                
+                                mode_radio = gr.Radio(
+                                    choices=["default", "fixed", "incremental", "randomized", "index"],
+                                    value="default",
+                                    label="Mode",
+                                    info="default: seed-based | fixed: specific line | incremental: cycle | randomized: random | index: from testing"
+                                )
+                                
+                                fixed_index = gr.Number(
+                                    value=0, minimum=0, precision=0,
+                                    label="Index",
+                                    info="Line number (0-based)",
+                                    visible=False
+                                )
+                                
+                                # Show/hide index field based on mode selection
+                                def make_toggle_fixed_index(fixed_comp):
+                                    def toggle_fixed_index(mode):
+                                        return gr.update(visible=(mode in ["fixed", "index"]))
+                                    return toggle_fixed_index
+                                
+                                mode_radio.change(
+                                    make_toggle_fixed_index(fixed_index),
+                                    inputs=[mode_radio],
+                                    outputs=[fixed_index]
+                                )
+                                
+                                promptconcat_components.extend([mode_radio, fixed_index])
+            
+            # Reset button for incremental counters
+            with gr.Row():
+                reset_counters_btn = gr.Button("🔄 Reset Counters", variant="secondary")
+                gr.Markdown("*Reset incremental counters to 0*")
+            
+            reset_status = gr.Textbox(label="Reset Status", visible=False)
+            reset_counters_btn.click(
+                reset_promptconcat_counters,
+                outputs=[reset_status]
+            )
+            
+            # Show reset status temporarily using imported callbacks
+            reset_counters_btn.click(show_component_temporarily, outputs=[reset_status])
+            reset_status.change(lambda x: hide_component() if x else gr.update(), inputs=[reset_status], outputs=[reset_status])
+        
+        # ---------------- Prompt Testing Section ----------------
+        with gr.Accordion("🧪 Prompt Testing & Preview", open=False) as prompt_testing_accordion:
+            gr.Markdown("**Test configurations and apply results to main panel**")
+            
+            # Testing configuration row
+            with gr.Row():
+                test_seed = gr.Number(
+                    value=42, label="Test Seed", info="Seed for testing"
+                )
+                test_mode = gr.Radio(
+                    choices=["deterministic", "incremental", "random"],
+                    value="deterministic",
+                    label="Test Mode", info="Default for all files"
+                )
+            
+            # Build the testing components (similar to main panel)
+            test_components = []
+            
+            if txt_base_dir.exists():
+                # Two-column layout for testing
+                with gr.Row():
+                    # Left column: Positive files (Testing)
+                    with gr.Column(scale=1):
+                        gr.Markdown("### ➕ Test Positive")
+                        for filename in positive_files:
+                            with gr.Group():
+                                gr.Markdown(f"**{filename}**")
+                                
+                                test_mode_radio = gr.Radio(
+                                    choices=["default", "fixed", "incremental", "randomized"],
+                                    value="default",
+                                    label="Mode",
+                                    info="default: seed | fixed: specific | incremental: cycle | randomized: random"
+                                )
+                                
+                                test_fixed_index = gr.Number(
+                                    value=0, minimum=0, precision=0,
+                                    label="Index",
+                                    info="Line number (0-based)",
+                                    visible=False
+                                )
+                                
+                                # Show/hide fixed index based on mode selection
+                                def make_test_toggle_fixed_index(fixed_comp):
+                                    def toggle_fixed_index(mode):
+                                        return gr.update(visible=(mode == "fixed"))
+                                    return toggle_fixed_index
+                                
+                                test_mode_radio.change(
+                                    make_test_toggle_fixed_index(test_fixed_index),
+                                    inputs=[test_mode_radio],
+                                    outputs=[test_fixed_index]
+                                )
+                                
+                                test_components.extend([test_mode_radio, test_fixed_index])
+                    
+                    # Right column: Negative files (Testing)
+                    with gr.Column(scale=1):
+                        gr.Markdown("### ➖ Test Negative")
+                        for filename in negative_files:
+                            with gr.Group():
+                                gr.Markdown(f"**{filename}**")
+                                
+                                test_mode_radio = gr.Radio(
+                                    choices=["default", "fixed", "incremental", "randomized"],
+                                    value="default",
+                                    label="Mode",
+                                    info="default: seed | fixed: specific | incremental: cycle | randomized: random"
+                                )
+                                
+                                test_fixed_index = gr.Number(
+                                    value=0, minimum=0, precision=0,
+                                    label="Index",
+                                    info="Line number (0-based)",
+                                    visible=False
+                                )
+                                
+                                # Show/hide fixed index based on mode selection
+                                def make_test_toggle_fixed_index(fixed_comp):
+                                    def toggle_fixed_index(mode):
+                                        return gr.update(visible=(mode == "fixed"))
+                                    return toggle_fixed_index
+                                
+                                test_mode_radio.change(
+                                    make_test_toggle_fixed_index(test_fixed_index),
+                                    inputs=[test_mode_radio],
+                                    outputs=[test_fixed_index]
+                                )
+                                
+                                test_components.extend([test_mode_radio, test_fixed_index])
+            
+            # Testing action buttons
+            with gr.Row():
+                test_generate_btn = gr.Button("🧪 Generate Test Prompts", variant="primary")
+                apply_to_main_btn = gr.Button("⚡ Apply Test Results to Main Panel", variant="secondary")
+                test_clear_btn = gr.Button("🗑️ Clear Test Results", variant="secondary")
+            
+            # Testing results section
+            with gr.Row():
+                with gr.Column(scale=1):
+                    test_positive_result = gr.Textbox(
+                        label="Test Positive Prompt",
+                        lines=4,
+                        interactive=False
+                    )
+                    test_negative_result = gr.Textbox(
+                        label="Test Negative Prompt", 
+                        lines=4,
+                        interactive=False
+                    )
+                
+                with gr.Column(scale=1):
+                    test_indices_result = gr.Textbox(
+                        label="Selected Indices",
+                        lines=3,
+                        interactive=False,
+                        info="Shows which line was selected from each file"
+                    )
+                    test_debug_result = gr.Textbox(
+                        label="Test Debug Info",
+                        lines=5,
+                        interactive=False
+                    )
+            
+            # Status for apply operation
+            apply_status = gr.Textbox(label="Apply Status", visible=False)
+
+        # PromptConcatenate debug log
+        promptconcat_debug_log = gr.Textbox(
+            label="PromptConcatenate Debug Log",
+            lines=8,
+            interactive=False,
+            visible=True,
+            value=""
+        )
 
         # -------------------------------------------------------------------
         # Dynamic workflow editors ------------------------------------------------
@@ -1909,6 +1275,7 @@ def launch_gui():
             *lora244_strengths,
             *lora307_inputs,
             *lora307_strengths,
+            *promptconcat_components,
         ]
 
         DEFAULT_VALUES = [c.value for c in ALL_COMPONENTS]
@@ -1916,55 +1283,22 @@ def launch_gui():
         # --------------------------------------------------
         # Preset callbacks
         # --------------------------------------------------
-        def _save_preset(*vals):
-            *cfg_vals, preset_name = vals
-            preset_name = preset_name.strip()
-            if not preset_name:
-                return gr.update()
-            path = PRESET_DIR / f"{preset_name}.json"
-            with open(path, "w") as f:
-                json.dump(cfg_vals, f)
-            choices = [p.stem for p in PRESET_DIR.glob("*.json")]
-            return gr.update(choices=choices, value=preset_name)
+        # Preset functions now imported from ui_callbacks
 
-        def _load_preset(selected_name):
-            if not selected_name:
-                return DEFAULT_VALUES
-            path = PRESET_DIR / f"{selected_name}.json"
-            if not path.exists():
-                return DEFAULT_VALUES
-            try:
-                cfg_vals = json.loads(path.read_text())
-                # safeguard length mismatch
-                if len(cfg_vals) != len(ALL_COMPONENTS):
-                    return DEFAULT_VALUES
-                return cfg_vals
-            except Exception:
-                return DEFAULT_VALUES
-
-        def _reset_defaults():
-            return DEFAULT_VALUES
+        # --------------------------------------------------
+        # Prompt Testing callbacks
+        # --------------------------------------------------
+        # Test prompt callback functions now imported from ui_callbacks
 
         # Now that ALL_COMPONENTS is defined, wire callbacks that depend on it
-        save_preset_btn.click(_save_preset, inputs=[*ALL_COMPONENTS, preset_name_txt], outputs=[presets_dd])
-        load_preset_btn.click(_load_preset, inputs=[presets_dd], outputs=ALL_COMPONENTS)
-        reset_btn.click(_reset_defaults, outputs=ALL_COMPONENTS)
+        save_preset_btn.click(save_preset_wrapper, inputs=[*ALL_COMPONENTS, preset_name_txt], outputs=[presets_dd])
+        load_preset_btn.click(lambda sel: load_preset_wrapper(sel, DEFAULT_VALUES), inputs=[presets_dd], outputs=ALL_COMPONENTS)
+        reset_btn.click(lambda: reset_to_defaults(DEFAULT_VALUES), outputs=ALL_COMPONENTS)
 
         # -------------------- Validation -----------------------
-        def _validate(*vals):
-            (
-                nsfw,
-                face_count,
-                partial_face,
-                batch_runs_val,
-            ) = vals
-            has_check = nsfw or face_count or partial_face
-            ok_batch = (batch_runs_val or 0) >= 1
-            return gr.update(interactive=bool(has_check and ok_batch))
-
         for comp in [do_nsfw_cb, do_face_count_cb, do_partial_face_cb, batch_runs_input]:
             comp.change(
-                _validate,
+                validate_pipeline_settings,
                 inputs=[do_nsfw_cb, do_face_count_cb, do_partial_face_cb, batch_runs_input],
                 outputs=[run_btn],
             )
@@ -2002,24 +1336,54 @@ def launch_gui():
                 *lora244_strengths,
                 *lora307_inputs,
                 *lora307_strengths,
+                *promptconcat_components,
             ],
             outputs=[
                 wf1_img_out,
                 log_text,
                 seeds_log_text,
-                wf2_img_out,
+                prompt_log_text,
                 album_gallery,
                 pending_box,
                 status_box,
                 metrics_box,
                 sound_audio,
+                promptconcat_debug_log,
             ],
         )
 
         # Wire the cancel button so that it sets the global flag and updates the pending box
-        cancel_btn.click(fn=_request_cancel, outputs=[pending_box, status_box, metrics_box, sound_audio])
+        cancel_btn.click(fn=_request_cancel, outputs=[pending_box, status_box, metrics_box, sound_audio, promptconcat_debug_log])
 
-    demo.queue().launch(server_name="0.0.0.0", server_port=18188, share=True, inbrowser=True)
+        # --------------------------------------------------
+        # Wire Prompt Testing callbacks
+        # --------------------------------------------------
+        test_generate_btn.click(
+            fn=generate_test_prompts,
+            inputs=[test_seed, test_mode, *test_components],
+            outputs=[test_positive_result, test_negative_result, test_indices_result, test_debug_result]
+        )
+        
+        test_clear_btn.click(
+            fn=clear_test_results,
+            outputs=[test_positive_result, test_negative_result, test_indices_result, test_debug_result]
+        )
+        
+        apply_to_main_btn.click(
+            fn=apply_test_results_to_main,
+            outputs=[apply_status, *promptconcat_components]
+        )
+        
+        # Show apply status temporarily using imported callbacks
+        apply_to_main_btn.click(show_component_temporarily, outputs=[apply_status])
+        apply_status.change(lambda x: hide_component() if x else gr.update(), inputs=[apply_status], outputs=[apply_status])
+
+    demo.queue().launch(
+        server_name=CONFIG.ui.SERVER_NAME,
+        server_port=CONFIG.ui.SERVER_PORT,
+        share=CONFIG.ui.SHARE,
+        inbrowser=CONFIG.ui.INBROWSER
+    )
 
 
 if __name__ == "__main__":

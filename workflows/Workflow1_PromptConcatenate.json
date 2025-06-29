@@ -17,12 +17,8 @@
     "inputs": {
       "delimiter": ", ",
       "clean_whitespace": "true",
-      "text_a": [
-        "171",
-        0
-      ],
       "text_b": [
-        "293",
+        "287",
         0
       ]
     },
@@ -70,8 +66,8 @@
   "164": {
     "inputs": {
       "text": [
-        "293",
-        1
+        "288",
+        0
       ],
       "clip": [
         "162",
@@ -218,25 +214,16 @@
   },
   "170": {
     "inputs": {
-      "text": "GirlNAME"
+      "text": "Geegee1_trigger"
     },
     "class_type": "ttN text",
     "_meta": {
       "title": "GirlName"
     }
   },
-  "171": {
-    "inputs": {
-      "text": "A photo of GeegeeDwa1 posing next to a white chair. She has long darkbrown hair styled in pigtails and very pale skin. She wears a vibrant sexy outfit. Her expression is a smirk. The background shows a modern apartment that exudes a candid atmosphere."
-    },
-    "class_type": "ttN text",
-    "_meta": {
-      "title": "Replace this with the characteristics of each girl"
-    }
-  },
   "173": {
     "inputs": {
-      "ckpt_name": "FNXL3/Blonde123.safetensors"
+      "ckpt_name": "Blonde123.safetensors"
     },
     "class_type": "CheckpointLoaderSimple",
     "_meta": {
@@ -254,7 +241,6 @@
   },
   "175": {
     "inputs": {
-      "text_0": "GirlNAME",
       "text": [
         "160",
         0
@@ -485,7 +471,7 @@
   },
   "189": {
     "inputs": {
-      "seed": 421094811206366
+      "seed": 173319755284960
     },
     "class_type": "Seed Everywhere",
     "_meta": {
@@ -525,35 +511,29 @@
   },
   "285": {
     "inputs": {
-      "seed": 992028944685711
+      "seed": 300233944106719
     },
     "class_type": "Seed Everywhere",
     "_meta": {
       "title": "Seed_KSampler_2"
     }
   },
-  "291": {
+  "287": {
     "inputs": {
-      "seed": 830495833936886
+      "text": ""
     },
-    "class_type": "Seed Everywhere",
+    "class_type": "ttN text",
     "_meta": {
-      "title": "Seed_PromptConcatUnified"
+      "title": "Positive Prompt"
     }
   },
-  "293": {
+  "288": {
     "inputs": {
-      "base_dir": "/home/eqx/workflow2/txt",
-      "positive_joiner": " ",
-      "negative_joiner": ", ",
-      "seed": [
-        "291",
-        0
-      ]
+      "text": ""
     },
-    "class_type": "Prompt Concatenate Unified - EQX",
+    "class_type": "ttN text",
     "_meta": {
-      "title": "Prompt Concatenate Unified - EQX"
+      "title": "Negative Prompt"
     }
   }
 }

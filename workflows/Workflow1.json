@@ -556,5 +556,29 @@
     "_meta": {
       "title": "Seed_KSampler_2"
     }
+  },
+  "286": {
+    "inputs": {
+      "text": [
+        "190",
+        1
+      ]
+    },
+    "class_type": "ShowText|pysssss",
+    "_meta": {
+      "title": "Positive Prompt"
+    }
+  },
+  "287": {
+    "inputs": {
+      "text": [
+        "190",
+        2
+      ]
+    },
+    "class_type": "ShowText|pysssss",
+    "_meta": {
+      "title": "Negative Prompt"
+    }
   }
 }

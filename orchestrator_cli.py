@@ -42,6 +42,8 @@ try:
     from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, SpinnerColumn
     from rich.panel import Panel
     from rich.rule import Rule
+    from rich.columns import Columns
+    from rich.layout import Layout
 except ImportError:
     Console = None  # Fallback if rich not installed
 
@@ -71,9 +73,6 @@ OVERRIDE_WF1 = [
     ("180", "text", str),
     ("182", "steps", int),
     ("190", "file_path", str),
-    ("293", "base_dir", str),
-    ("293", "positive_joiner", str),
-    ("293", "negative_joiner", str),
 ]
 
 OVERRIDE_WF2 = [
@@ -123,37 +122,75 @@ def _load_preset_values(preset_path: str | Path) -> List[Any]:
 
 
 def _normalize_values(values: List[Any]) -> List[Any]:
-    """Sanitize *values* so they match the positional parameters expected by
-    *run_pipeline_gui* when executed head-less.
+    """Return *values* padded (if necessary) so that it contains at least the
+    fixed parameters required by *run_pipeline_gui*.
 
-    Layout expected:
-        0..18   – the 19 fixed arguments (see run_pipeline_gui signature)
-        19..19+cat_len-1 – one boolean per NSFW category (excl. NOT_DETECTED)
-        *MIDDLE* – (variable) workflow override widgets **to discard**
-        last 24 – LoRA paths & strengths (keep if present)
+    The previous implementation tried to be clever by slicing the list into
+    separate blocks (fixed → categories → overrides → LoRAs) and then
+    rebuilding it with hard-coded lengths.  Every time the GUI introduced a
+    new widget this brittle logic broke, causing mismatches between the
+    stored preset and the arguments consumed by *run_pipeline_gui*.
+
+    We now adopt a much simpler rule: keep the exact order that was stored by
+    the GUI.  The first 20 elements correspond to the positional arguments of
+    *run_pipeline_gui*; everything that follows is consumed by the variadic
+    *dynamic_values parameter.  As long as those first 20 items exist (we pad
+    with *None* if they do not) the pipeline will run happily, regardless of
+    how many new widgets get added in the future.
     """
+
+    # Ensure there are at least the fixed parameters expected by
+    # run_pipeline_gui (currently 20).  We deliberately avoid making any
+    # assumptions about what comes after those 20 items so that the CLI stays
+    # forward-compatible with new GUI features.
+    if len(values) < _FIXED_COUNT:
+        values += [None] * (_FIXED_COUNT - len(values))
+
+    # ------------------------------------------------------------------
+    # Detect and patch *dynamic_values* mis-alignment caused by presets
+    # saved with older GUI versions (before Auto-LoRA flag & directory
+    # inputs were introduced).  These presets lack two elements right
+    # after the override-mapping block, hence every subsequent LoRA path
+    #/strength value is shifted two positions to the left and the first
+    # "strength" slot receives a file path → ValueError later.
+    # ------------------------------------------------------------------
+
     cat_keys = [k for k in gui.CATEGORY_DISPLAY_MAPPINGS.keys() if k != "NOT_DETECTED"]
     cat_len = len(cat_keys)
     prefix_len = _FIXED_COUNT + cat_len
 
-    lora_present = len(values) >= _LORA_COUNT
-    lora_tail = values[-_LORA_COUNT:] if lora_present else []
+    # Guarantee that override placeholders exist (older presets might also
+    # miss some of them if the GUI gained new override widgets).
+    if len(values) < prefix_len + _OVERRIDES_LEN:
+        values += [None] * ((prefix_len + _OVERRIDES_LEN) - len(values))
 
-    # Determine override segment
-    start_override = prefix_len
-    end_override = start_override + _OVERRIDES_LEN
-    overrides_seg = values[start_override:end_override]
+    after_overrides_idx = prefix_len + _OVERRIDES_LEN
 
-    # Pad overrides if missing
-    if len(overrides_seg) < _OVERRIDES_LEN:
-        overrides_seg += [None] * (_OVERRIDES_LEN - len(overrides_seg))
+    # If the element at *after_overrides_idx* is NOT a boolean, we assume the
+    # preset predates the Auto-LoRA flag and directory fields.  Inject them.
+    needs_inject = False
+    if len(values) <= after_overrides_idx:
+        needs_inject = True  # list too short → definitely missing
+    else:
+        needs_inject = not isinstance(values[after_overrides_idx], bool)
 
-    # Asegurar que la lista contiene al menos los parámetros fijos + categorías
-    if len(values) < prefix_len:
-        values += [None] * (prefix_len - len(values))
+    if needs_inject:
+        values[after_overrides_idx:after_overrides_idx] = [False, ""]
 
-    sanitized = values[:prefix_len] + overrides_seg + lora_tail
-    return sanitized
+    # Finally, make sure we have at least the 24 subsequent LoRA path/strength
+    # slots so that indexing inside run_pipeline_gui is safe.  We pad with
+    # sensible defaults ("" for paths, 0.0 for strengths) but only if they are
+    # actually missing – never truncate existing data.
+    lora_start = after_overrides_idx + 2
+    missing = (lora_start + 24) - len(values)
+    if missing > 0:
+        # Alternate between empty path and default strength 0.3 for padding
+        pad: list[Any] = []
+        for i in range(missing):
+            pad.append(0.3 if i % 2 else "")
+        values += pad
+
+    return values
 
 
 def _stream_pipeline(values: List[Any], expected_runs: int | None, wf1_mode: str):
@@ -181,23 +218,12 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None, wf1_mode: str
     current_attempt = 0
     # Track JSON collection per attempt
     collecting_check: dict[int, list[str]] = {}
-    recent_log = deque(maxlen=50)
+    # Rolling buffers to emulate the GUI log panes -----------------------
+    recent_log = deque(maxlen=60)          # main log lines
+    recent_seeds = deque(maxlen=40)        # seeds log
+    recent_prompts = deque(maxlen=40)      # prompts log
 
-    # Progress bar setup
-    from rich.progress import ProgressColumn
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("{task.description}"),
-        BarColumn(bar_width=None, complete_style="cyan", finished_style="green"),
-        TextColumn("{task.completed}/{task.total}"),
-        TimeRemainingColumn(),
-    )
-
-    progress_task = None
-    if expected_runs:
-        progress_task = progress.add_task("Approved", total=expected_runs)
-
-    # Start time for statistics (needs to be available before first _render_group call)
+    # Start time for statistics
     start_time_cli = time.time()
 
     def _build_table() -> Table:
@@ -287,10 +313,20 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None, wf1_mode: str
                 row.get("SavedAs", ""),
             )
 
-        if progress_task is not None:
-            separator = Rule(style="grey50")
-            return Group(separator, progress, out_panel, tbl, stats_panel)
-        return Group(out_panel, tbl, stats_panel)
+        # ---- Seeds & Prompts panels ------------------------------------
+        from rich.text import Text as _Txt2
+        seeds_panel = _Pnl(_Txt2("\n".join(recent_seeds) or "-", overflow="fold"), title="Seeds", border_style="grey37", expand=False, height=12)
+        prompts_panel = _Pnl(_Txt2("\n".join(recent_prompts) or "-", overflow="fold"), title="Prompts", border_style="grey37", expand=False, height=12)
+
+        # Force a single-row layout with two equal parts (left/right)
+        logs_row = Layout()
+        logs_row.split_row(
+            Layout(seeds_panel, name="seeds", ratio=1),
+            Layout(prompts_panel, name="prompts", ratio=1),
+        )
+
+        separator = Rule(style="grey50")
+        return Group(separator, out_panel, tbl, stats_panel, logs_row)
 
     def _ensure_attempt(idx: int):
         if idx not in attempts:
@@ -320,37 +356,33 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None, wf1_mode: str
             last_len = 0
             last_approved = 0
             last_seed_len = 0  # Track processed length of seeds log
+            last_prompt_len = 0  # Track processed length of prompts log
             last_refresh = 0.0
 
             for step in gen:
                 log_text = step[1] if len(step) > 1 else ""
                 seeds_text = step[2] if len(step) > 2 else ""
+                prompt_text = step[3] if len(step) > 3 else ""
                 pending = step[5] if len(step) > 5 else ""
                 status = step[6] if len(step) > 6 else ""
                 metrics = step[7] if len(step) > 7 and step[7] is not None else ""
 
-                # Detect approved increment for progress bar
-                if progress_task is not None:
-                    m = re.search(r"Approved:\s*(\d+)", metrics)
-                    approved_now = int(m.group(1)) if m else last_approved
-                    if approved_now > last_approved:
-                        progress.update(progress_task, completed=approved_now)
-                    last_approved = approved_now
-
-                # Parse new log lines
+                # Parse new log lines and push them to recent_log buffer
                 lines = log_text.splitlines()
                 new_lines = lines[last_len:]
                 last_len = len(lines)
 
                 for ln in new_lines:
+                    recent_log.append(ln)
                     if ln.startswith("========== ATTEMPT"):
                         # Extract attempt number and initialise placeholders
                         m = re.search(r"ATTEMPT\s+(\d+)", ln)
                         if m:
                             new_attempt = int(m.group(1))
-                            if new_attempt != current_attempt and current_attempt != 0:
-                                # Keep cumulative log (no clear)
-                                pass
+                            if new_attempt != current_attempt:
+                                # New attempt ⇒ reset per-attempt panels
+                                recent_seeds.clear()
+                                recent_prompts.clear()
                             current_attempt = new_attempt
                             _ensure_attempt(current_attempt)
                             attempt_starts[current_attempt] = time.time()
@@ -448,6 +480,25 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None, wf1_mode: str
                                 attempts[current_attempt]["Checks"] = "-"
                             collecting_check.pop(current_attempt, None)
 
+                # -------------- Extract Normal Mode Prompts ----------------
+                # Look for output lines from node 190 to get the actual prompts
+                if ln.startswith("[OUTPUT] Node 190") or "Load Prompt From File - EQX" in ln:
+                    # Try to extract prompts from node 190 output logs
+                    if "prompt:" in ln.lower():
+                        # Extract positive prompt
+                        parts = ln.split("prompt:", 1)
+                        if len(parts) > 1:
+                            prompt_part = parts[1].strip()
+                            if not any(p.startswith("Positive Prompt:") for p in recent_prompts):
+                                recent_prompts.append(f"Positive Prompt: {prompt_part}")
+                    elif "negative_prompt:" in ln.lower():
+                        # Extract negative prompt
+                        parts = ln.split("negative_prompt:", 1)
+                        if len(parts) > 1:
+                            neg_part = parts[1].strip()
+                            if not any(p.startswith("Negative Prompt:") for p in recent_prompts):
+                                recent_prompts.append(f"Negative Prompt: {neg_part}")
+
                 # -------------- Parse Seeds Log (panel) -----------------------
                 seeds_lines = seeds_text.splitlines()
                 new_seed_lines = seeds_lines[last_seed_len:]
@@ -455,22 +506,25 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None, wf1_mode: str
 
                 seed_attempt = None
                 for s_ln in new_seed_lines:
-                    if s_ln.startswith("Attempt"):
-                        m_at = re.search(r"Attempt\s+(\d+)", s_ln)
+                    # Skip header lines that start with "=== Seeds Log"
+                    if not s_ln.startswith("=== Seeds Log"):
+                        recent_seeds.append(s_ln)
+                    # Detect attempt header (e.g., "========== ATTEMPT 1 | ..." or "Attempt 1 ...")
+                    if "ATTEMPT" in s_ln:
+                        m_at = re.search(r"ATTEMPT\s+(\d+)", s_ln)
                         if m_at:
                             seed_attempt = int(m_at.group(1))
                             _ensure_attempt(seed_attempt)
+                            # Set PromptSeed to "N/A" for PromptConcatenate mode
+                            if wf1_mode == "PromptConcatenate":
+                                attempts[seed_attempt]["PromptSeed"] = "N/A"
                         continue
 
                     if seed_attempt is None:
                         continue
 
-                    # PromptSeed detection depending on mode
-                    if wf1_mode.lower().startswith("prompt") and "PromptConcat seed" in s_ln:
-                        m = re.search(r":\s*(\d+)", s_ln)
-                        if m:
-                            attempts[seed_attempt]["PromptSeed"] = m.group(1)
-                    elif not wf1_mode.lower().startswith("prompt") and "Prompt loader seed" in s_ln:
+                    # PromptSeed detection (only for Normal mode)
+                    if "Prompt loader seed" in s_ln and wf1_mode != "PromptConcatenate":
                         m = re.search(r":\s*(\d+)", s_ln)
                         if m:
                             attempts[seed_attempt]["PromptSeed"] = m.group(1)
@@ -481,8 +535,15 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None, wf1_mode: str
                         if m:
                             attempts[seed_attempt]["ImageSeed"] = m.group(1)
 
-                    # Append every processed line to rolling log
-                    recent_log.append(s_ln)
+                # -------------------- PROMPTS LOG PANEL ------------------
+                if prompt_text:
+                    prompt_lines = prompt_text.splitlines()
+                    new_prompt_lines = prompt_lines[last_prompt_len:]
+                    last_prompt_len = len(prompt_lines)
+                    for p_ln in new_prompt_lines:
+                        # Skip header lines that start with "=== Prompts Log"
+                        if not p_ln.startswith("=== Prompts Log"):
+                            recent_prompts.append(p_ln)
 
                 # Update renderable in place after processing current batch
                 live.update(_render_group(), refresh=True)
@@ -496,8 +557,6 @@ def _stream_pipeline(values: List[Any], expected_runs: int | None, wf1_mode: str
             except Exception:
                 pass
         finally:
-            if progress_task is not None:
-                progress.stop_task(progress_task)
             stop_refresh.set()
             refresher.join(timeout=1)
 
