@@ -216,6 +216,8 @@ def run_pipeline_gui(
 
     # This variable will hold either None (no sound) or (sr, arr)
     sound_placeholder: str | tuple[int, np.ndarray] | None = None
+    # Current filename preview (empty until known)
+    filename_preview: str = ""
 
     def _boxes(pend):
         return (
@@ -224,6 +226,7 @@ def run_pipeline_gui(
             _metrics_str(),
             sound_placeholder,
             _promptconcat_debug_str(),
+            filename_preview,
         )
 
     status_str = "Idle"
@@ -431,12 +434,41 @@ def run_pipeline_gui(
         if attempt > 1:
             prompt_log_lines.append("")
         
-        total_target = "∞" if endless_until_cancel else target_successes
         prompt_log_lines.extend([
             f"========== ATTEMPT {attempt} | Passed {success_count}/{total_target} ==========",
             f"Positive Prompt: {pos_prompt if pos_prompt is not None else 'No prompt found'}",
             f"Negative Prompt: {neg_prompt if neg_prompt is not None else 'No prompt found'}",
         ])
+
+        # --------------------------------------------------------------
+        # Predict final filename (for UI preview) ----------------------
+        # --------------------------------------------------------------
+        try:
+            base_candidate = extract_filename_base_util(
+                wf1_path_mod,
+                wf2_path_mod,
+                is_promptconcat,
+                pos_prompt,
+                neg_prompt,
+                override_save_name,
+                save_name_base,
+            )
+
+            if override_save_name and save_name_base.strip():
+                base_candidate = save_name_base.strip()
+
+            # Determine next available index in final_dir
+            idx = 1
+            while (final_dir / f"{base_candidate}_{idx}.png").exists():
+                idx += 1
+            filename_preview = f"{base_candidate}_{idx}.png"
+        except Exception:
+            filename_preview = "(preview unavailable)"
+
+        # Update UI with predicted filename
+        current_log = "\n\n".join(log_lines)
+        pending = "∞" if endless_until_cancel else max(0, target_successes - success_count)
+        yield None, current_log, _seeds_log_str(), _prompt_log_str(), album_images, *_boxes(pending)
 
         # ------------------------------------------------------------------
         # Run Workflow 1
@@ -625,6 +657,9 @@ def run_pipeline_gui(
             except Exception as e_cleanup:
                 log_lines.extend([f"[CLEANUP] Could not delete intermediate WF2 image: {e_cleanup}"])
 
+            # Update filename preview so UI shows the final output name
+            filename_preview = final_path.name
+
         except Exception as e:
             log_lines.extend([f"Warning: could not copy final image to {final_path}: {e}"])
 
@@ -739,7 +774,7 @@ def launch_gui():
 
             # Right column: Logs (modularized)
             with gr.Column(scale=1):
-                log_text, seeds_log_text, prompt_log_text = create_logs_section()
+                log_text, seeds_log_text, prompt_log_text, filename_log_text = create_logs_section()
 
         # Dynamic workflow editors ------------------------------------------------
 
@@ -1349,6 +1384,7 @@ def launch_gui():
                 metrics_box,
                 sound_audio,
                 promptconcat_debug_log,
+                filename_log_text,
             ],
         )
 

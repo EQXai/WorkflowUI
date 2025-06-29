@@ -252,7 +252,10 @@ def create_logs_section():
     with gr.Accordion("Prompts Log", open=False):
         prompt_log_text = create_log_textbox(lines=CONFIG.ui.DEFAULT_PROMPT_LOG_LINES)
 
-    return log_text, seeds_log_text, prompt_log_text
+    with gr.Accordion("Output Filename", open=False):
+        filename_log_text = create_log_textbox(lines=2)
+
+    return log_text, seeds_log_text, prompt_log_text, filename_log_text
 
 def create_directory_section():
     """Create directory input section."""
@@ -502,28 +505,6 @@ def create_images_gallery_section() -> Tuple[gr.components.Component, ...]:
     return wf1_img_out, album_gallery, sound_audio
 
 # =============================================================================
-# LOGS SECTION
-# =============================================================================
-
-def create_logs_section() -> Tuple[gr.components.Component, ...]:
-    """
-    Create the logs display section with different log types.
-    
-    Returns:
-        Tuple of log display components
-    """
-    with gr.Accordion("Log", open=True):
-        log_text = create_log_textbox(lines=CONFIG.ui.DEFAULT_LOG_LINES)
-    
-    with gr.Accordion("Seeds Log", open=False):
-        seeds_log_text = create_log_textbox(lines=CONFIG.ui.DEFAULT_SEED_LOG_LINES)
-    
-    with gr.Accordion("Prompts Log", open=False):
-        prompt_log_text = create_log_textbox(lines=CONFIG.ui.DEFAULT_PROMPT_LOG_LINES)
-
-    return log_text, seeds_log_text, prompt_log_text
-
-# =============================================================================
 # WORKFLOW COMPONENT FACTORY
 # =============================================================================
 
@@ -771,7 +752,7 @@ def create_main_layout() -> Tuple[gr.components.Component, ...]:
 
         # Right column: Logs
         with gr.Column(scale=1):
-            log_text, seeds_log_text, prompt_log_text = create_logs_section()
+            log_text, seeds_log_text, prompt_log_text, filename_log_text = create_logs_section()
 
     # Combine all components for easier return
     all_components = (
@@ -780,7 +761,7 @@ def create_main_layout() -> Tuple[gr.components.Component, ...]:
         seed_mode_radio, seed_counter_input,
         *output_components,
         wf1_img_out, album_gallery, sound_audio,
-        log_text, seeds_log_text, prompt_log_text
+        log_text, seeds_log_text, prompt_log_text, filename_log_text
     )
     
     return all_components 
