@@ -169,7 +169,7 @@ def setup_temporary_prompt_file(load_prompts_directly: bool, prompt_list_str: st
     except Exception as e:
         raise RuntimeError(f"Could not create temporary prompt file: {e}")
 
-def prepare_workflows(is_promptconcat: bool, wf1_edit_vals: List, wf2_edit_vals: List, 
+def prepare_workflows(is_promptconcat: bool, workflow2_mode: bool, wf1_edit_vals: List, wf2_edit_vals: List, 
                      wf1_mapping: List, wf2_mapping: List) -> Tuple[str, str]:
     """Prepare modified workflow copies according to edits."""
     if is_promptconcat:
@@ -177,8 +177,14 @@ def prepare_workflows(is_promptconcat: bool, wf1_edit_vals: List, wf2_edit_vals:
     else:
         wf1_original_path = oc.WORKFLOW1_JSON
     
+    # Choose workflow2 based on mode: True = OneStep, False = TwoSteps
+    if workflow2_mode:
+        wf2_original_path = oc.WORKFLOW2_ONESTEP_JSON
+    else:
+        wf2_original_path = oc.WORKFLOW2_TWOSTEPS_JSON
+    
     wf1_path_mod = apply_workflow_edits(wf1_original_path, wf1_mapping, wf1_edit_vals)
-    wf2_path_mod = apply_workflow_edits(oc.WORKFLOW2_JSON, wf2_mapping, wf2_edit_vals)
+    wf2_path_mod = apply_workflow_edits(wf2_original_path, wf2_mapping, wf2_edit_vals)
     
     return wf1_path_mod, wf2_path_mod
 

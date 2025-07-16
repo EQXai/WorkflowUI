@@ -196,6 +196,7 @@ def run_pipeline_gui(
     batch_runs: int,
     endless_until_cancel: bool,
     play_sound: bool,
+    workflow2_mode: bool,
     seed_mode: str,
     seed_counter_input: int | float,
     override_save_name: bool,
@@ -270,7 +271,7 @@ def run_pipeline_gui(
         return None, {}, "", str(e), None, "In Queue: 0", "Error", _metrics_str(), None, f"Error creating temporary file: {e}"
 
     # Prepare workflows using centralized utility
-    wf1_path_mod, wf2_path_mod = prepare_workflows(is_promptconcat, wf1_edit_vals, wf2_edit_vals, WF1_MAPPING, WF2_MAPPING)
+    wf1_path_mod, wf2_path_mod = prepare_workflows(is_promptconcat, workflow2_mode, wf1_edit_vals, wf2_edit_vals, WF1_MAPPING, WF2_MAPPING)
 
     # Apply LoRA overrides using centralized utility
     apply_lora_overrides(wf2_path_mod, override_loras_244_flag, override_loras_307_flag,
@@ -746,7 +747,7 @@ def launch_gui():
         )
 
         # Main controls and status (modularized)
-        batch_runs_input, run_btn, cancel_btn, endless_until_cancel_cb, play_sound_cb = create_main_controls_section()
+        batch_runs_input, run_btn, cancel_btn, endless_until_cancel_cb, play_sound_cb, workflow2_mode_cb = create_main_controls_section()
         pending_box, status_box, metrics_box = create_status_boxes_section()
 
         with gr.Row():
@@ -1294,6 +1295,7 @@ def launch_gui():
             batch_runs_input,
             endless_until_cancel_cb,
             play_sound_cb,
+            workflow2_mode_cb,
             seed_mode_radio,
             seed_counter_input,
             override_filename_cb,
@@ -1355,6 +1357,7 @@ def launch_gui():
                 batch_runs_input,
                 endless_until_cancel_cb,
                 play_sound_cb,
+                workflow2_mode_cb,
                 seed_mode_radio,
                 seed_counter_input,
                 override_filename_cb,

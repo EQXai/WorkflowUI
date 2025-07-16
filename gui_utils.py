@@ -190,8 +190,13 @@ def apply_workflow_edits(
             except Exception:
                 pass
 
+        # Only apply override if the node and inputs exist in the workflow
         if node_id in data and "inputs" in data[node_id]:
             data[node_id]["inputs"][key] = cast_val
+        else:
+            # Silently skip overrides for nodes that don't exist in this workflow
+            # This allows OneStep and TwoSteps to work with the same override mappings
+            pass
 
     tmp_fd, tmp_path = tempfile.mkstemp(suffix="_workflow.json")
     import os

@@ -78,8 +78,13 @@ def create_preset_section() -> Tuple[gr.components.Component, ...]:
         rename_txt, rename_btn, import_file
     )
 
-def create_main_controls_section():
-    """Create the main pipeline control section."""
+def create_main_controls_section() -> Tuple[gr.components.Component, ...]:
+    """
+    Create the main pipeline control section with batch size, run/cancel buttons.
+    
+    Returns:
+        Tuple of main control components
+    """
     with gr.Row():
         with gr.Column(scale=3, min_width=120):  # Batch Size
             batch_runs_input = gr.Number(
@@ -90,11 +95,13 @@ def create_main_controls_section():
         with gr.Column(scale=14, min_width=400):  # Run Pipeline & Cancel
             run_btn = gr.Button("🚀 Run Pipeline", variant="primary", size="lg")
             cancel_btn = gr.Button("⏹️ Cancel", variant="stop")
-        with gr.Column(scale=3, min_width=120):  # Endless Mode & Sound Alert
+        with gr.Column(scale=3, min_width=120):  # Endless Mode & Sound Alert & Workflow2 Selection
             endless_until_cancel_cb = gr.Checkbox(label="🔁 Endless Mode", value=False)
             play_sound_cb = gr.Checkbox(label="🔊 Sound Alert", value=True)
+            workflow2_mode_cb = gr.Checkbox(label="⚡ One Step Mode", value=False, 
+                                           info="Use OneStep (checked) or TwoSteps (unchecked)")
 
-    return batch_runs_input, run_btn, cancel_btn, endless_until_cancel_cb, play_sound_cb
+    return batch_runs_input, run_btn, cancel_btn, endless_until_cancel_cb, play_sound_cb, workflow2_mode_cb
 
 def create_status_boxes_section():
     """Create the status display boxes."""
@@ -270,28 +277,7 @@ def create_directory_section():
     
     return output_dir_input, final_dir_input
 
-def create_main_controls_section() -> Tuple[gr.components.Component, ...]:
-    """
-    Create the main pipeline control section with batch size, run/cancel buttons.
-    
-    Returns:
-        Tuple of main control components
-    """
-    with gr.Row():
-        with gr.Column(scale=3, min_width=120):  # Batch Size
-            batch_runs_input = gr.Number(
-                value=1, minimum=1, precision=0,
-                label="Batch Size",
-                info="Images to generate"
-            )
-        with gr.Column(scale=14, min_width=400):  # Run Pipeline & Cancel
-            run_btn = gr.Button("🚀 Run Pipeline", variant="primary", size="lg")
-            cancel_btn = gr.Button("⏹️ Cancel", variant="stop")
-        with gr.Column(scale=3, min_width=120):  # Endless Mode & Sound Alert
-            endless_until_cancel_cb = gr.Checkbox(label="🔁 Endless Mode", value=False)
-            play_sound_cb = gr.Checkbox(label="🔊 Sound Alert", value=True)
 
-    return batch_runs_input, run_btn, cancel_btn, endless_until_cancel_cb, play_sound_cb
 
 # =============================================================================
 # STATUS BOXES SECTION

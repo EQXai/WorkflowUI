@@ -61,7 +61,12 @@ WORKFLOW_DIR = Path(os.getenv("WORKFLOW_DIR", str(Path(__file__).parent / "workf
 # Paths to the workflows used by the pipeline (relative to project root)
 WORKFLOW1_JSON = str(WORKFLOW_DIR / "Workflow1.json")
 WORKFLOW1_PROMPTCONCAT_JSON = str(WORKFLOW_DIR / "Workflow1_PromptConcatenate.json")
-WORKFLOW2_JSON = str(WORKFLOW_DIR / "Workflow2.json")
+# WORKFLOW2_JSON removed - now using WORKFLOW2_ONESTEP_JSON and WORKFLOW2_TWOSTEPS_JSON directly
+WORKFLOW2_ONESTEP_JSON = str(WORKFLOW_DIR / "Workflow2_OneStep.json")
+WORKFLOW2_TWOSTEPS_JSON = str(WORKFLOW_DIR / "Workflow2_TwoSteps.json")
+
+# Default to TwoSteps for backward compatibility with existing override controls
+WORKFLOW2_JSON = WORKFLOW2_TWOSTEPS_JSON
 
 # Node ID from Workflow2 that loads an image from a path. Adjust if you change
 # Workflow2.

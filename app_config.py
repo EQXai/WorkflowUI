@@ -36,7 +36,7 @@ class UIConfig:
     
     # Server configuration
     SERVER_NAME: str = "0.0.0.0"
-    SERVER_PORT: int = 18188
+    SERVER_PORT: int = 7860
     SHARE: bool = True
     INBROWSER: bool = True
 
